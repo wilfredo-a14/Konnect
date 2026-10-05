@@ -587,10 +587,17 @@ async fn handle_open_viewer(
                 Err(message) => Ok(CallToolResult::error(message)),
             }
         }
-        None => Ok(CallToolResult::error(
-            "Schematic viewer binary (schematic-viewer.exe) not found. \
-             It should be in the same directory as konnect.exe.",
-        )),
+        None => Ok(CallToolResult::error(format!(
+            "Schematic viewer binary ({viewer}) not found. It should be in the same \
+             directory as the {konnect} binary. Only the KiCad Plugin and Content Manager \
+             package of a release (konnect-pcm-*.zip) ships it.",
+            viewer = VIEWER_BINARY,
+            konnect = if cfg!(target_os = "windows") {
+                "konnect.exe"
+            } else {
+                "konnect"
+            },
+        ))),
     }
 }
 
@@ -676,15 +683,18 @@ async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Resu
     })
 }
 
+/// The viewer's file name on this platform.
+const VIEWER_BINARY: &str = if cfg!(target_os = "windows") {
+    "schematic-viewer.exe"
+} else {
+    "schematic-viewer"
+};
+
 fn find_viewer_binary() -> Option<std::path::PathBuf> {
     // Check next to the current executable
     if let Ok(exe_path) = std::env::current_exe() {
         let dir = exe_path.parent()?;
-        let viewer = dir.join(if cfg!(target_os = "windows") {
-            "schematic-viewer.exe"
-        } else {
-            "schematic-viewer"
-        });
+        let viewer = dir.join(VIEWER_BINARY);
         if viewer.exists() {
             return Some(viewer);
         }
