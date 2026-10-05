@@ -1094,8 +1094,10 @@ pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
     let project_name = escape_quoted_text(spec.project_name);
     let parent_instance_path = escape_quoted_text(spec.parent_instance_path);
     let page = escape_quoted_text(spec.page);
-    let name_y = spec.y - 0.635;
-    let file_y = spec.y + spec.height + 0.635;
+    // Rounded as KiCad writes coordinates: y + height + 0.635 is not exact in
+    // binary and would otherwise print as 99.69500000000001.
+    let name_y = crate::geometry::round6(spec.y - 0.635);
+    let file_y = crate::geometry::round6(spec.y + spec.height + 0.635);
     format!(
         r#"
   (sheet

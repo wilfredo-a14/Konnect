@@ -93,10 +93,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_file": { "type": "string", "description": "Filename of the child .kicad_sch, resolved relative to the parent's directory" },
                     "sheet_name": { "type": "string", "description": "Display name (Sheetname property). Default: 'Sheet'" },
-                    "x": { "type": "number", "description": "Top-left X in mm. Default: 50" },
-                    "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
-                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box width in mm. Default: 80" },
-                    "height": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box height in mm. Default: 50" },
+                    "x": { "type": "number", "description": "Top-left X in mm, snapped to the 1.27 mm grid like the size. Default: 50 (49.53)" },
+                    "y": { "type": "number", "description": "Top-left Y in mm, snapped to the grid. Default: 50 (49.53)" },
+                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box width in mm, snapped to the grid. Default: 80 (80.01)" },
+                    "height": { "type": "number", "exclusiveMinimum": 0, "description": "Sheet box height in mm, snapped to the grid. Default: 50 (49.53)" },
                     "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: the schematic file's stem (matching eeschema)" }
                 },
                 "required": ["schematic", "sheet_file"]
@@ -535,17 +535,20 @@ impl SheetBox {
 
     /// The edge `side` names, or `None` for a name that is not one.
     fn edge(&self, side: &str) -> Option<SheetEdge> {
+        // Rounded like every coordinate KiCad writes: 49.53 + 80.01 is
+        // 129.54000000000002 in f64, which then shows up in messages.
+        let round = konnect_sexp::geometry::round6;
         let (axis, coordinate) = match side {
-            "right" => ("x", self.x + self.width),
+            "right" => ("x", round(self.x + self.width)),
             "left" => ("x", self.x),
             "top" => ("y", self.y),
-            "bottom" => ("y", self.y + self.height),
+            "bottom" => ("y", round(self.y + self.height)),
             _ => return None,
         };
         let (span_axis, span_start, span_end) = if axis == "x" {
-            ("y", self.y, self.y + self.height)
+            ("y", self.y, round(self.y + self.height))
         } else {
-            ("x", self.x, self.x + self.width)
+            ("x", self.x, round(self.x + self.width))
         };
         Some(SheetEdge {
             axis,
@@ -1555,7 +1558,8 @@ async fn handle_duplicate_sheet(
         )));
     }
 
-    const DUPLICATE_OFFSET_MM: f64 = 20.0;
+    // 16 grid steps, so the copy of an on-grid sheet stays on the grid.
+    const DUPLICATE_OFFSET_MM: f64 = 20.32;
     let page = next_free_page(&parent, &project_name).to_string();
     let (parent_base, root_uuid) = ensure_source_root_uuid(&parent_before)?;
     let parent_base = ensure_hierarchy_root_footer(&parent_base)?;
@@ -2254,16 +2258,16 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         // the opposite edge would always be refused for its old coordinate.
         if !matches!(position, (Some(_), Some(_))) {
             if let Some(edge) = sheet_box.edge(side) {
+                // Ordered bounds: a malformed box with a negative size has its
+                // span backwards, and f64::clamp panics on that.
+                let (low, high) = (
+                    edge.span_start.min(edge.span_end),
+                    edge.span_start.max(edge.span_end),
+                );
                 let (x, y) = if edge.axis == "x" {
-                    (
-                        edge.coordinate,
-                        pin.at.y.clamp(edge.span_start, edge.span_end),
-                    )
+                    (edge.coordinate, pin.at.y.clamp(low, high))
                 } else {
-                    (
-                        pin.at.x.clamp(edge.span_start, edge.span_end),
-                        edge.coordinate,
-                    )
+                    (pin.at.x.clamp(low, high), edge.coordinate)
                 };
                 if (pin.at.x, pin.at.y) != (x, y) {
                     pin.at.x = x;
@@ -3089,7 +3093,7 @@ mod tests {
         assert_eq!(parent.sheets.len(), 2);
         let amp2 = parent.sheets.by_name("Amp2").unwrap();
         assert_eq!(amp2.file(), "amp2.kicad_sch");
-        assert_eq!(amp2.position(), (30.16, 30.16)); // offset from source (10.16, 10.16)
+        assert_eq!(amp2.position(), (30.48, 30.48)); // offset from source (10.16, 10.16)
 
         // Independent files: the two schematics have different internal UUIDs.
         let sch1 = cse::Schematic::load(tmp.path().join("amp.kicad_sch")).unwrap();
@@ -4058,6 +4062,31 @@ mod tests {
         assert!(!result.is_error, "{result:?}");
         assert_eq!(pin_rotation(&root, "CLK"), Some(270.0));
         assert_eq!(position(&root), (49.53, 99.06));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_survives_a_sheet_with_a_negative_size() {
+        // A hand-written file can give a sheet a negative size, which turns
+        // an edge's span around; clamping a pin onto it must not panic.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "pin_type": "input", "x": 129.54, "y": 59.69 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        shrink_without_moving_pins(&root, -20.0);
+
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "side": "left" }),
+            &ctx,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]

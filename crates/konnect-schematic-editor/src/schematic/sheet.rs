@@ -379,14 +379,17 @@ impl Sheet {
         self.height = height;
         let (left, top) = (self.at.x, self.at.y);
         let (right, bottom) = (left + width, top + height);
+        // Ordered bounds: f64::clamp panics when a negative size reverses them.
+        let (y_low, y_high) = (top.min(bottom), top.max(bottom));
+        let (x_low, x_high) = (left.min(right), left.max(right));
         for pin in &mut self.pins {
             let rotation = pin.at.rotation.unwrap_or(0.0).rem_euclid(360.0).round();
             if rotation == 0.0 || rotation == 180.0 {
                 pin.at.x = if rotation == 0.0 { right } else { left };
-                pin.at.y = pin.at.y.clamp(top, bottom);
+                pin.at.y = pin.at.y.clamp(y_low, y_high);
             } else if rotation == 90.0 || rotation == 270.0 {
                 pin.at.y = if rotation == 270.0 { bottom } else { top };
-                pin.at.x = pin.at.x.clamp(left, right);
+                pin.at.x = pin.at.x.clamp(x_low, x_high);
             }
         }
         for prop in &mut self.properties {
