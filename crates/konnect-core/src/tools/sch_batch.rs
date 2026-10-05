@@ -71,6 +71,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["net_label", "global_label"],
                         "default": "net_label"
                     },
+                    "label_orientation": {
+                        "type": "string",
+                        "enum": ["horizontal", "along_stub"],
+                        "default": "horizontal",
+                        "description": crate::tools::LABEL_ORIENTATION_DESC
+                    },
                     "pins": {
                         "type": "array",
                         "description": "List of {reference, pin_number} objects to connect",
@@ -443,6 +449,10 @@ pub(crate) async fn handle_batch_connect_to_net(
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(0.0);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
+    let along_stub = match crate::tools::labels_along_stub(args) {
+        Ok(along) => along,
+        Err(error) => return Ok(error),
+    };
     // Plain labels on the pin keep the string splice; anything else goes
     // through the editor model connect_to_net uses.
     let is_splice = stub_length == 0.0 && label_type == "net_label";
@@ -504,7 +514,10 @@ pub(crate) async fn handle_batch_connect_to_net(
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        let mut dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        if along_stub {
+            dir = dir.along_stub();
+        }
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
 
@@ -4511,6 +4524,60 @@ mod batch_connect_options_tests {
                 );
             }
         }
+    }
+
+    /// `label_orientation: along_stub` turns a label on an up or down stub to
+    /// run along it, in both tools; left and right stubs and the default keep
+    /// labels horizontal, so nothing changes for a caller that does not ask.
+    #[tokio::test]
+    async fn labels_can_run_along_vertical_stubs() {
+        let single = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .find(|t| t.name == "connect_to_net")
+            .unwrap();
+        for (options, rotation) in [
+            (json!({ "direction": "up" }), 0.0),
+            (
+                json!({ "direction": "up", "label_orientation": "along_stub" }),
+                90.0,
+            ),
+            (
+                json!({ "direction": "down", "label_orientation": "along_stub" }),
+                270.0,
+            ),
+            (
+                json!({ "direction": "right", "label_orientation": "along_stub" }),
+                0.0,
+            ),
+            (
+                json!({ "direction": "left", "label_orientation": "along_stub" }),
+                180.0,
+            ),
+        ] {
+            let (_d, path) = fixture();
+            let mut args = options.clone();
+            args["net"] = json!("N");
+            args["stub_length"] = json!(2.54);
+            let result = batch(&path, args.clone()).await;
+            for added in body(&result)["added"].as_array().unwrap() {
+                assert_eq!(added["label"]["rotation"], rotation, "{options}: {added}");
+            }
+
+            let (_d2, path) = fixture();
+            args["schematic"] = json!(path.display().to_string());
+            args["reference"] = json!("U1");
+            args["pin_number"] = json!("5");
+            let r = (single.handler)(&args, Arc::new(ctx())).await.unwrap();
+            assert_eq!(body(&r)["label"]["rotation"], rotation, "{options}");
+        }
+
+        let (_d, path) = fixture();
+        let refused = batch(
+            &path,
+            json!({ "net": "N", "label_orientation": "vertical" }),
+        )
+        .await;
+        assert!(refused.is_error, "{refused:?}");
     }
 
     /// Each explicit option set draws exactly what one `connect_to_net`

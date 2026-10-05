@@ -1284,6 +1284,34 @@ impl StubDirection {
     pub(crate) fn end(&self, (x, y): (f64, f64), length: f64) -> (f64, f64) {
         (x + self.dx * length, y + self.dy * length)
     }
+
+    /// Turn the label to run along its stub, 90° up or 270° down, instead of
+    /// the horizontal default. A row of vertical pins a few millimetres apart
+    /// otherwise gets horizontal labels written over one another.
+    pub(crate) fn along_stub(mut self) -> Self {
+        if let Some(row) = STUB_DIRECTIONS.iter().find(|row| row.0 == self.name) {
+            self.label_rotation = row.3;
+        }
+        self
+    }
+}
+
+/// `label_orientation` for the stub-and-label tools.
+pub(crate) const LABEL_ORIENTATION_DESC: &str =
+    "'horizontal' (default) keeps label text horizontal, as KiCad's own schematics do for a \
+     label on a pin. 'along_stub' turns a label on an up or down stub to run along it (90° or \
+     270°), for a row of vertical pins too close together for horizontal labels.";
+
+/// Whether `label_orientation` asks for labels along their stubs.
+pub(crate) fn labels_along_stub(args: &serde_json::Value) -> Result<bool, CallToolResult> {
+    match args.get("label_orientation").map(|v| v.as_str()) {
+        None | Some(Some("horizontal")) => Ok(false),
+        Some(Some("along_stub")) => Ok(true),
+        _ => Err(invalid_arg(
+            "label_orientation",
+            "expected 'horizontal' or 'along_stub'",
+        )),
+    }
 }
 
 /// Resolve a `direction` argument against an already-known outward direction.

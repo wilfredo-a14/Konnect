@@ -359,6 +359,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["net_label", "global_label"],
                         "default": "net_label"
+                    },
+                    "label_orientation": {
+                        "type": "string",
+                        "enum": ["horizontal", "along_stub"],
+                        "default": "horizontal",
+                        "description": crate::tools::LABEL_ORIENTATION_DESC
                     }
                 },
                 "required": ["schematic", "net"]
@@ -2546,10 +2552,15 @@ async fn handle_connect_to_net(
 
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
-    let dir = match outward {
+    let mut dir = match outward {
         Some(d) => crate::tools::stub_direction(direction, Some(d)),
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
+    match crate::tools::labels_along_stub(args) {
+        Ok(true) => dir = dir.along_stub(),
+        Ok(false) => {}
+        Err(error) => return Ok(error),
+    }
     let mut sch = cse::Schematic::load(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     let (label_x, label_y, label_rot) = add_net_stub(
