@@ -257,7 +257,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_name": { "type": "string" },
                     "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": SHEET_PIN_SIDE_DESC }
+                    "side": { "type": "string", "enum": ["right", "left", "top", "bottom"], "description": EDIT_SHEET_PIN_SIDE_DESC }
                 },
                 "required": ["schematic", "sheet_name", "pin_name"]
             }),
@@ -441,6 +441,13 @@ const SHEET_PIN_SIDE_DESC: &str =
      inferred from the position. When given, the position must already be on that edge or \
      the call is refused, because KiCad would otherwise move the pin to the named edge on \
      load. Default: 'right', which is what these tools have always written.";
+
+const EDIT_SHEET_PIN_SIDE_DESC: &str =
+    "Which edge of the sheet box the pin sits on. This is what KiCad reads the pin's \
+     orientation from (right 0°, top 90°, left 180°, bottom 270°). Given without x+y, the \
+     pin moves onto that edge and keeps its place along it, clamped to the edge's length. \
+     Given with x+y, that position must be on the named edge or the call is refused, \
+     because KiCad would otherwise move the pin to the named edge on load.";
 
 const PROJECT_NAME_DESC: &str =
     "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
@@ -2195,7 +2202,8 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         pin.pin_type = pt.to_string();
         changed.push("pin_type");
     }
-    if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
+    let position = (opt_f64(args, "x"), opt_f64(args, "y"));
+    if let (Some(x), Some(y)) = position {
         requested.push("position");
         pin.at.x = x;
         pin.at.y = y;
@@ -2207,6 +2215,29 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     // is already on it, so the guard runs before the delta is taken.
     if let (Some(side), Some(rotation)) = (requested_side.as_deref(), requested_rotation) {
         requested.push("side");
+        // A side without a position moves the pin onto that edge, keeping its
+        // place along it as far as the edge reaches. Otherwise moving a pin to
+        // the opposite edge would always be refused for its old coordinate.
+        if !matches!(position, (Some(_), Some(_))) {
+            if let Some(edge) = sheet_box.edge(side) {
+                let (x, y) = if edge.axis == "x" {
+                    (
+                        edge.coordinate,
+                        pin.at.y.clamp(edge.span_start, edge.span_end),
+                    )
+                } else {
+                    (
+                        pin.at.x.clamp(edge.span_start, edge.span_end),
+                        edge.coordinate,
+                    )
+                };
+                if (pin.at.x, pin.at.y) != (x, y) {
+                    pin.at.x = x;
+                    pin.at.y = y;
+                    changed.push("position");
+                }
+            }
+        }
         if let Err(e) =
             ensure_pin_is_on_sheet_edge(sheet_box, &sheet_name, side, pin.at.x, pin.at.y)
         {
@@ -3859,9 +3890,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_sheet_pin_refuses_a_side_the_pin_is_not_already_on() {
-        // `side` with no position: the pin does not move, so it has to already
-        // be on that edge.
+    async fn edit_sheet_pin_moves_a_pin_onto_a_side_given_alone() {
+        // `side` with no position moves the pin onto that edge, keeping its
+        // place along it as far as the edge reaches. Before, the pin kept its
+        // old coordinate, so moving it to any other edge was always refused.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
@@ -3872,7 +3904,33 @@ mod tests {
         )
         .await
         .unwrap();
+        let position = |root: &Path| {
+            let sch = cse::Schematic::load(root).unwrap();
+            let at = &sch
+                .sheets
+                .by_name("A")
+                .unwrap()
+                .pin_by_name("CLK")
+                .unwrap()
+                .at;
+            (at.x, at.y)
+        };
 
+        // Right edge (x 130) to left edge (x 50): same height.
+        let result = handle_edit_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "pin_name": "CLK", "side": "left" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(pin_rotation(&root, "CLK"), Some(180.0));
+        assert_eq!(position(&root), (50.0, 55.0));
+        let changed = &result_json(&result)["changed_fields"];
+        assert_eq!(changed, &json!(["position", "side"]), "{changed}");
+
+        // Left edge to bottom edge (y 100): x stays within the edge's 50..130.
         let result = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "CLK", "side": "bottom" }),
@@ -3880,9 +3938,9 @@ mod tests {
         )
         .await
         .unwrap();
-
-        assert!(result.is_error);
-        assert_eq!(pin_rotation(&root, "CLK"), Some(0.0), "nothing was written");
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(pin_rotation(&root, "CLK"), Some(270.0));
+        assert_eq!(position(&root), (50.0, 100.0));
     }
 
     #[tokio::test]
