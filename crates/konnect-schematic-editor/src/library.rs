@@ -457,6 +457,82 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
     }
 }
 
+/// A library field beyond KiCad's five mandatory ones, such as `MPN`,
+/// `Manufacturer` or `LCSC Part`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomField {
+    pub name: String,
+    pub value: String,
+    /// `(x, y, rotation)` of the field text, library-local mm/degrees.
+    pub at: Option<(f64, f64, f64)>,
+    pub hidden: bool,
+    pub justify: FieldJustify,
+}
+
+/// The custom fields `lib_id`'s embedded symbol defines, in library order.
+///
+/// eeschema copies every library field onto a placed symbol, so a BOM built
+/// from the instances carries a part's MPN and supplier numbers. The `ki_*`
+/// properties (`ki_keywords`, `ki_fp_filters`, …) describe the library entry
+/// itself and are never copied.
+pub fn custom_fields(schematic: &Schematic, lib_id: &str) -> Vec<CustomField> {
+    const MANDATORY: [&str; 5] = [
+        "Reference",
+        "Value",
+        "Footprint",
+        "Datasheet",
+        "Description",
+    ];
+    let Some(symbol) = embedded_lib_symbol(schematic, lib_id) else {
+        return Vec::new();
+    };
+    symbol
+        .find_all("property")
+        .into_iter()
+        .filter_map(|prop| {
+            let name = prop.value()?;
+            if MANDATORY.contains(&name) || name.starts_with("ki_") {
+                return None;
+            }
+            let value = prop
+                .args()
+                .get(1)
+                .and_then(SexpNode::text)
+                .unwrap_or_default();
+            let at = prop.find("at").and_then(|at| {
+                let s = at.scalar_args();
+                let num = |i: usize| s.get(i).and_then(|v| v.parse::<f64>().ok());
+                Some((num(0)?, num(1)?, num(2).unwrap_or(0.0)))
+            });
+            Some(CustomField {
+                name: name.to_string(),
+                value: value.to_string(),
+                at,
+                hidden: property_hidden(prop),
+                justify: FieldJustify::of_property(prop),
+            })
+        })
+        .collect()
+}
+
+/// Whether a `(property …)` is hidden, in any of the spellings KiCad has
+/// written: `(hide yes)` on the property (KiCad 9+), `(hide yes)` inside its
+/// `(effects …)`, or the bare `hide` atom in `(effects …)` (KiCad 6–8, and
+/// what easyeda2kicad still writes).
+fn property_hidden(prop: &SexpNode) -> bool {
+    let flag = |node: Option<&SexpNode>| {
+        node.is_some_and(|hide| hide.args().is_empty() || hide.bool_value() == Some(true))
+    };
+    let effects = prop.find("effects");
+    flag(prop.find("hide"))
+        || flag(effects.and_then(|e| e.find("hide")))
+        || effects.is_some_and(|e| {
+            e.args()
+                .iter()
+                .any(|n| matches!(n, SexpNode::Atom(a) if a == "hide"))
+        })
+}
+
 /// [`FieldAnchors`] of a resolved symbol node.
 ///
 /// Only direct `(property …)` children count: a unit sub-symbol carries its

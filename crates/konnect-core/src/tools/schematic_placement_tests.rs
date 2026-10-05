@@ -1270,3 +1270,87 @@ async fn a_power_symbol_is_snapped_through_the_served_dispatch() {
     assert_eq!(placed["x"].as_f64(), Some(symbol.at.x));
     assert_eq!(placed["y"].as_f64(), Some(symbol.at.y));
 }
+
+/// A placed symbol carries every library field, not just the mandatory five:
+/// a BOM reads MPN and supplier numbers from the instance, never from
+/// lib_symbols. Each spelling of "hidden" KiCad and easyeda2kicad write must
+/// survive, and the library's own `ki_*` entries must not be copied.
+#[tokio::test]
+async fn served_placement_copies_custom_library_fields() {
+    let (_directory, path) = standalone_rotation_fixture();
+    install_horizontal_test_symbol(&path);
+    let symdir = path.parent().unwrap().join("Test.kicad_symdir");
+    let horizontal = std::fs::read_to_string(symdir.join("HORIZONTAL.kicad_sym")).unwrap();
+    let custom = r#"		(property "MPN" "ABC-123"
+			(at 0 -4.064 0)
+			(hide yes)
+			(effects (font (size 1.27 1.27)))
+		)
+		(property "LCSC Part" "C12345"
+			(at 0 -6.096 0)
+			(effects (font (size 1.27 1.27)) hide)
+		)
+		(property "Note" "visible"
+			(at 1.27 4.064 0)
+			(effects (font (size 1.27 1.27)))
+		)
+		(property "ki_keywords" "test part"
+			(at 0 0 0)
+			(hide yes)
+			(effects (font (size 1.27 1.27)))
+		)
+		(symbol "SOURCED_1_1""#;
+    let sourced = horizontal.replace("HORIZONTAL", "SOURCED").replacen(
+        "\t\t(symbol \"SOURCED_1_1\"",
+        custom,
+        1,
+    );
+    std::fs::write(symdir.join("SOURCED.kicad_sym"), sourced).unwrap();
+
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        project_dir: None,
+        jlcpcb_db_path: None,
+        auto_load_toolsets: true,
+        eager_toolsets: false,
+    })
+    .await
+    .unwrap();
+    let result = handler
+        .handle_message(json!({"jsonrpc": "2.0", "id": 790, "method": "tools/call",
+        "params": {"name": "batch_place_components", "arguments": {
+            "schematic": path.display().to_string(),
+            "components": [{"lib_id": "Test:SOURCED", "reference": "U9", "x": 50.8, "y": 50.8}]
+        }}}))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert_ne!(result["isError"], json!(true), "{result}");
+
+    let committed = std::fs::read_to_string(&path).unwrap();
+    let (start, end) = crate::tools::find_symbol_instance_block(&committed, "U9").unwrap();
+    let placed = konnect_schematic_editor::sexp::parser::parse(&committed[start..end]).unwrap();
+    let field = |name: &str| {
+        placed
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.value() == Some(name))
+            .cloned()
+    };
+    for (name, value, hidden) in [
+        ("MPN", "ABC-123", true),
+        ("LCSC Part", "C12345", true),
+        ("Note", "visible", false),
+    ] {
+        let prop = field(name).unwrap_or_else(|| panic!("{name} missing from the instance"));
+        assert_eq!(prop.args()[1].text(), Some(value), "{name}");
+        assert_eq!(prop.find("hide").is_some(), hidden, "{name} visibility");
+    }
+    assert!(
+        field("ki_keywords").is_none(),
+        "ki_* fields stay in the library"
+    );
+}

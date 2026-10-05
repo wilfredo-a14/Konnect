@@ -801,6 +801,21 @@ pub(crate) fn place_one_component(
         true,
         centred,
     ));
+    // Every other library field (MPN, Manufacturer, LCSC Part, …) is copied
+    // too, where and as visible as the library has it, like eeschema does: a
+    // BOM reads the instance, never lib_symbols.
+    for field in cse::library::custom_fields(sch, lib_id) {
+        let (fx, fy, frot) = crate::tools::field_at(field.at, (0.0, 0.0, 0.0), t);
+        sym.properties.push(positioned(
+            &field.name,
+            &field.value,
+            fx,
+            fy,
+            frot,
+            field.hidden,
+            field.justify,
+        ));
+    }
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
