@@ -1348,13 +1348,16 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         // Like eeschema, never shrink the box past a pin: clamping two pins
         // onto the same corner would join their nets on the parent sheet.
         let (left, top) = sheet.position();
+        let mut too_short = false;
         let stranded: Vec<String> = sheet
             .pins
             .iter()
             .filter(|pin| {
                 let rotation = pin.at.rotation.unwrap_or(0.0).rem_euclid(360.0).round();
                 if rotation == 0.0 || rotation == 180.0 {
-                    pin.at.y > top + h
+                    let past = pin.at.y > top + h;
+                    too_short |= past;
+                    past
                 } else {
                     pin.at.x > left + w
                 }
@@ -1363,7 +1366,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             .collect();
         if !stranded.is_empty() {
             return Ok(invalid_arg(
-                "width",
+                if too_short { "height" } else { "width" },
                 &format!(
                     "a {w} x {h} box would leave pins past its edges: {}. Move or delete \
                      those pins first, or keep the box large enough to hold them.",
@@ -4194,6 +4197,7 @@ mod tests {
             message.contains("P at") && message.contains("Q at"),
             "{message}"
         );
+        assert_eq!(result_json(&result)["error"]["field"], "height");
         assert_eq!(
             std::fs::read_to_string(&root).unwrap(),
             before,
