@@ -3886,6 +3886,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_sheet_resize_keeps_pins_and_caption_on_the_box() {
+        // Pins and the Sheetfile caption carry absolute coordinates. A resize
+        // that only changed width/height left the right- and bottom-edge pins
+        // where the old edges were, and KiCad would then move them on load.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        for (name, side, x, y) in [
+            ("R", "right", 130.0, 60.0),
+            ("B", "bottom", 90.0, 100.0),
+            ("L", "left", 50.0, 95.0),
+        ] {
+            let added = handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input", "side": side, "x": x, "y": y }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!added.is_error, "{added:?}");
+        }
+        let caption_y = |root: &Path| {
+            let sch = cse::Schematic::load(root).unwrap();
+            let sheet = sch.sheets.by_name("A").unwrap();
+            let file = sheet
+                .properties
+                .iter()
+                .find(|p| p.name == "Sheetfile")
+                .unwrap();
+            let at = file
+                .sub_nodes
+                .iter()
+                .find(|n| n.tag() == Some("at"))
+                .unwrap();
+            cse::At::from_sexp(at).unwrap().y
+        };
+        let caption_before = caption_y(&root);
+
+        // 80 x 50 to 100 x 40: right edge 130 -> 150, bottom 100 -> 90.
+        let result = handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 100.0, "height": 40.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&root).unwrap();
+        let sheet = sch.sheets.by_name("A").unwrap();
+        let at = |name: &str| {
+            let pin = sheet.pin_by_name(name).unwrap();
+            (pin.at.x, pin.at.y)
+        };
+        assert_eq!(at("R"), (150.0, 60.0), "right-edge pin follows the edge");
+        assert_eq!(at("B"), (90.0, 90.0), "bottom-edge pin follows the edge");
+        assert_eq!(
+            at("L"),
+            (50.0, 90.0),
+            "a pin past the new corner is pulled in"
+        );
+        assert_eq!(
+            caption_y(&root),
+            caption_before - 10.0,
+            "caption stays under the box"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_sheet_pin_counts_side_on_its_own_as_a_change() {
         // `side` on its own is a legal one-field edit, not the "no fields to
         // change" refusal — and here it is a real one, moving the pin from the

@@ -364,9 +364,43 @@ impl Sheet {
             pin.at.translate(dx, dy);
         }
     }
+    /// Resize the box from its top-left corner, keeping every pin on its edge.
+    ///
+    /// Pins and the `Sheetfile` caption carry absolute coordinates, so changing
+    /// only `width`/`height` left right- and bottom-edge pins where the old
+    /// edge was, and KiCad moves an off-edge pin to the nearest edge on load.
+    /// As in eeschema's own resize, each pin is put back on the edge its
+    /// rotation names and kept within that edge's new length, and captions
+    /// below the box follow the bottom edge.
     pub fn set_size(&mut self, width: f64, height: f64) {
+        let old_bottom = self.at.y + self.height;
+        let dh = height - self.height;
         self.width = width;
         self.height = height;
+        let (left, top) = (self.at.x, self.at.y);
+        let (right, bottom) = (left + width, top + height);
+        for pin in &mut self.pins {
+            let rotation = pin.at.rotation.unwrap_or(0.0).rem_euclid(360.0).round();
+            if rotation == 0.0 || rotation == 180.0 {
+                pin.at.x = if rotation == 0.0 { right } else { left };
+                pin.at.y = pin.at.y.clamp(top, bottom);
+            } else if rotation == 90.0 || rotation == 270.0 {
+                pin.at.y = if rotation == 270.0 { bottom } else { top };
+                pin.at.x = pin.at.x.clamp(left, right);
+            }
+        }
+        for prop in &mut self.properties {
+            for node in &mut prop.sub_nodes {
+                if node.tag() == Some("at") {
+                    if let Some(mut at) = At::from_sexp(node) {
+                        if at.y >= old_bottom {
+                            at.translate(0.0, dh);
+                            *node = at.to_sexp();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- pins -------------------------------------------------------------------
