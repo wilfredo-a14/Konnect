@@ -18,8 +18,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use konnect_sexp::{
-    commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
-    FileTransition, ItemAnchor, ItemId, SchematicCommand,
+    commit_command, commit_file_transaction, geometry::snap_to_grid, parse_sexp, prepare_command,
+    read_consistent, FileTransition, ItemAnchor, ItemId, SchematicCommand,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1140,14 +1140,18 @@ async fn handle_add_hierarchical_sheet(
         Err(e) => return Ok(e),
     };
     let sheet_name = opt_str(args, "sheet_name").unwrap_or("Sheet").to_string();
-    let x = opt_f64(args, "x").unwrap_or(50.0);
-    let y = opt_f64(args, "y").unwrap_or(50.0);
+    // The box goes on the 1.27 mm grid like every other placer, size included:
+    // its pins sit on its edges, and a wire snapped to the grid cannot reach a
+    // pin on an edge that is not.
+    let grid = |value: f64| snap_to_grid(value, 1.27);
+    let x = grid(opt_f64(args, "x").unwrap_or(50.0));
+    let y = grid(opt_f64(args, "y").unwrap_or(50.0));
     let width = match opt_positive_f64(args, "width") {
-        Ok(width) => width.unwrap_or(80.0),
+        Ok(width) => grid(width.unwrap_or(80.0)).max(1.27),
         Err(error) => return Ok(error),
     };
     let height = match opt_positive_f64(args, "height") {
-        Ok(height) => height.unwrap_or(50.0),
+        Ok(height) => grid(height.unwrap_or(50.0)).max(1.27),
         Err(error) => return Ok(error),
     };
     let project_name = opt_str(args, "project_name")
@@ -1325,8 +1329,11 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
             changed.push("file");
         }
     }
+    // Position and size go on the 1.27 mm grid, as add_hierarchical_sheet does.
+    let grid = |value: f64| snap_to_grid(value, 1.27);
     if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
         requested.push("position");
+        let (x, y) = (grid(x), grid(y));
         if sheet.at.x != x || sheet.at.y != y {
             sheet.move_to(x, y);
             changed.push("position");
@@ -1334,6 +1341,7 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     }
     if let (Some(w), Some(h)) = (requested_width, requested_height) {
         requested.push("size");
+        let (w, h) = (grid(w).max(1.27), grid(h).max(1.27));
         // Like eeschema, never shrink the box past a pin: clamping two pins
         // onto the same corner would join their nets on the parent sheet.
         let (left, top) = sheet.position();
@@ -1399,11 +1407,11 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         Err(e) => return Ok(e),
     };
     let x = match require_f64(args, "x") {
-        Ok(v) => v,
+        Ok(v) => snap_to_grid(v, 1.27),
         Err(e) => return Ok(e),
     };
     let y = match require_f64(args, "y") {
-        Ok(v) => v,
+        Ok(v) => snap_to_grid(v, 1.27),
         Err(e) => return Ok(e),
     };
 
@@ -2582,7 +2590,7 @@ mod tests {
             "schematic": root.display().to_string(),
             "sheet_file": "power.kicad_sch",
             "sheet_name": "Power Supply",
-            "x": 20.0, "y": 20.0
+            "x": 20.32, "y": 20.32
         });
         let result = handle_add_hierarchical_sheet(&args, &ctx).await.unwrap();
         assert!(!result.is_error);
@@ -2655,13 +2663,13 @@ mod tests {
     async fn edit_sheet_accepts_the_position_the_sheet_already_has() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
         let before = std::fs::read_to_string(&root).unwrap();
 
         let args = json!({
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
-            "x": 20.0, "y": 20.0
+            "x": 20.32, "y": 20.32
         });
         let result = handle_edit_sheet(&args, &ctx).await.unwrap();
 
@@ -2681,7 +2689,7 @@ mod tests {
     async fn direct_sheet_handlers_refuse_non_positive_sizes_without_writing() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
         let before = std::fs::read_to_string(&root).unwrap();
 
         let edited = handle_edit_sheet(
@@ -2725,14 +2733,14 @@ mod tests {
     async fn edit_sheet_reports_only_the_fields_that_differ() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
 
         // Position is restated, the name is genuinely new.
         let args = json!({
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
             "new_name": "Power Supply",
-            "x": 20.0, "y": 20.0
+            "x": 20.32, "y": 20.32
         });
         let result = handle_edit_sheet(&args, &ctx).await.unwrap();
 
@@ -2747,12 +2755,12 @@ mod tests {
     async fn move_sheet_accepts_the_position_the_sheet_already_has() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
 
         let args = json!({
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
-            "x": 20.0, "y": 20.0
+            "x": 20.32, "y": 20.32
         });
         let result = handle_move_sheet(&args, &ctx).await.unwrap();
 
@@ -2764,11 +2772,11 @@ mod tests {
     async fn edit_sheet_is_idempotent_on_a_sheet_konnect_already_wrote() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
         let move_it = json!({
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
-            "x": 30.0, "y": 30.0
+            "x": 30.48, "y": 30.48
         });
 
         // The first edit rewrites the sheet in Konnect's own serialisation, so
@@ -2793,13 +2801,13 @@ mod tests {
     async fn edit_sheet_pin_accepts_the_position_the_pin_already_has() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
         let add = json!({
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
             "pin_name": "VCC",
             "pin_type": "input",
-            "x": 20.0, "y": 25.0
+            "x": 20.32, "y": 25.0
         });
         handle_add_sheet_pin(&add, &ctx).await.unwrap();
 
@@ -2807,7 +2815,7 @@ mod tests {
             "schematic": root.display().to_string(),
             "sheet_name": "Power",
             "pin_name": "VCC",
-            "x": 20.0, "y": 25.0
+            "x": 20.32, "y": 25.0
         });
         handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
         let result = handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
@@ -2824,7 +2832,7 @@ mod tests {
     async fn edit_sheet_still_rejects_a_call_with_no_fields() {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
-        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let root = sheet_at(&tmp, &ctx, 20.32, 20.32).await;
 
         let args = json!({
             "schematic": root.display().to_string(),
@@ -2886,7 +2894,7 @@ mod tests {
         .unwrap();
 
         let result = handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "new_name": "Renamed", "width": 100.0, "height": 60.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "new_name": "Renamed", "width": 101.6, "height": 60.96 }),
             &ctx,
         )
         .await
@@ -2896,8 +2904,8 @@ mod tests {
         let parent = cse::Schematic::load(&root).unwrap();
         assert!(parent.sheets.by_name("A").is_none());
         let renamed = parent.sheets.by_name("Renamed").unwrap();
-        assert_eq!(renamed.width, 100.0);
-        assert_eq!(renamed.height, 60.0);
+        assert_eq!(renamed.width, 101.6);
+        assert_eq!(renamed.height, 60.96);
     }
 
     #[tokio::test]
@@ -2927,14 +2935,14 @@ mod tests {
         let root = blank_schematic(tmp.path(), "root.kicad_sch");
         let ctx = test_ctx();
         handle_add_hierarchical_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A", "x": 10.0, "y": 10.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A", "x": 10.16, "y": 10.16 }),
             &ctx,
         )
         .await
         .unwrap();
 
         handle_move_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "x": 99.0, "y": 88.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "x": 99.06, "y": 87.63 }),
             &ctx,
         )
         .await
@@ -2942,7 +2950,74 @@ mod tests {
 
         let parent = cse::Schematic::load(&root).unwrap();
         let sheet = parent.sheets.by_name("A").unwrap();
-        assert_eq!(sheet.position(), (99.0, 88.0));
+        assert_eq!(sheet.position(), (99.06, 87.63));
+    }
+
+    #[tokio::test]
+    async fn sheet_handlers_put_the_box_on_the_schematic_grid() {
+        // Wires snap to the 1.27 mm grid and a sheet's pins sit on its edges, so
+        // a box with an edge off the grid has pins no wire can reach. Every
+        // handler that places or resizes the box snaps its corner and its size,
+        // which puts all four edges on the grid whatever the caller asked for.
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        let on_grid = |value: f64| ((value / 1.27).round() * 1.27 - value).abs() < 1e-6;
+        // The saved box, once every one of its edges is proven to be on the grid.
+        let saved_box = |after: &str| {
+            let parent = cse::Schematic::load(&root).unwrap();
+            let sheet = parent.sheets.by_name("A").unwrap();
+            let (x, y) = sheet.position();
+            for (edge, value) in [
+                ("left", x),
+                ("top", y),
+                ("right", x + sheet.width),
+                ("bottom", y + sheet.height),
+            ] {
+                assert!(
+                    on_grid(value),
+                    "after {after}, the {edge} edge at {value} is off the 1.27 mm grid"
+                );
+            }
+            (x, y, sheet.width, sheet.height)
+        };
+
+        let added = handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch",
+                     "sheet_name": "A", "x": 50.3, "y": 41.9, "width": 33.3, "height": 21.1 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!added.is_error, "{added:?}");
+        assert_eq!(
+            saved_box("add_hierarchical_sheet"),
+            (50.8, 41.91, 33.02, 21.59)
+        );
+
+        let moved = handle_move_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "x": 77.7, "y": 63.1 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!moved.is_error, "{moved:?}");
+        let body = result_json(&moved);
+        assert_eq!(body["x"], json!(77.47), "move_sheet reports the snapped x");
+        assert_eq!(body["y"], json!(63.5), "move_sheet reports the snapped y");
+        assert_eq!(saved_box("move_sheet"), (77.47, 63.5, 33.02, 21.59));
+
+        // A size that rounds to nothing keeps one grid step instead of collapsing.
+        let edited = handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "x": 100.1, "y": 30.2, "width": 44.4, "height": 0.5 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!edited.is_error, "{edited:?}");
+        assert_eq!(saved_box("edit_sheet"), (100.33, 30.48, 44.45, 1.27));
     }
 
     #[tokio::test]
@@ -2990,7 +3065,7 @@ mod tests {
         let root = blank_schematic(tmp.path(), "root.kicad_sch");
         let ctx = test_ctx();
         handle_add_hierarchical_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_file": "amp.kicad_sch", "sheet_name": "Amp1", "x": 10.0, "y": 10.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "amp.kicad_sch", "sheet_name": "Amp1", "x": 10.16, "y": 10.16 }),
             &ctx,
         )
         .await
@@ -3014,7 +3089,7 @@ mod tests {
         assert_eq!(parent.sheets.len(), 2);
         let amp2 = parent.sheets.by_name("Amp2").unwrap();
         assert_eq!(amp2.file(), "amp2.kicad_sch");
-        assert_eq!(amp2.position(), (30.0, 30.0)); // offset from source (10,10)
+        assert_eq!(amp2.position(), (30.16, 30.16)); // offset from source (10.16, 10.16)
 
         // Independent files: the two schematics have different internal UUIDs.
         let sch1 = cse::Schematic::load(tmp.path().join("amp.kicad_sch")).unwrap();
@@ -3122,7 +3197,7 @@ mod tests {
                 "schematic": root.display().to_string(),
                 "sheet_file": "amp.kicad_sch",
                 "sheet_name": "Amp1",
-                "x": 10.0, "y": 10.0
+                "x": 10.16, "y": 10.16
             }),
             &ctx,
         )
@@ -3477,19 +3552,24 @@ mod tests {
 
     // ─── sheet pin sides ───────────────────────────────────────────────────
     //
-    // The default sheet `handle_add_hierarchical_sheet` writes is 80 × 50 at
-    // (50, 50), so its edges are x = 50 (left), x = 130 (right), y = 50 (top)
-    // and y = 100 (bottom).
+    // The sheet these tests work on is the default box — 80 × 50 at (50, 50) —
+    // as `handle_add_hierarchical_sheet` snaps it onto the 1.27 mm grid:
+    // 80.01 × 49.53 at (49.53, 49.53). Its edges are x = 49.53 (left),
+    // x = 129.54 (right), y = 49.53 (top) and y = 99.06 (bottom), and like the
+    // box it stands for, its left edge holds 19 pins at 2.54 mm and its top
+    // edge 31.
 
     /// A sheet with the default box, plus the paths to work on it.
     async fn sheet_for_pins(tmp: &TempDir, ctx: &ToolContext) -> PathBuf {
         let root = blank_schematic(tmp.path(), "root.kicad_sch");
-        handle_add_hierarchical_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+        let added = handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch",
+                     "sheet_name": "A", "x": 49.53, "y": 49.53, "width": 80.01, "height": 49.53 }),
             ctx,
         )
         .await
         .unwrap();
+        assert!(!added.is_error, "{added:?}");
         root
     }
 
@@ -3524,10 +3604,10 @@ mod tests {
 
         // name, side, position on that edge, the angle KiCad reads it back as
         let cases = [
-            ("R_PIN", "right", 130.0, 55.0, 0.0),
-            ("T_PIN", "top", 60.0, 50.0, 90.0),
-            ("L_PIN", "left", 50.0, 60.0, 180.0),
-            ("B_PIN", "bottom", 70.0, 100.0, 270.0),
+            ("R_PIN", "right", 129.54, 55.0, 0.0),
+            ("T_PIN", "top", 60.0, 49.53, 90.0),
+            ("L_PIN", "left", 49.53, 60.0, 180.0),
+            ("B_PIN", "bottom", 70.0, 99.06, 270.0),
         ];
         for (name, side, x, y, expected_rotation) in cases {
             let result = handle_add_sheet_pin(
@@ -3576,7 +3656,7 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            message.contains("'top' edge") && message.contains("y = 50"),
+            message.contains("'top' edge") && message.contains("y = 49.53"),
             "the refusal must name the edge and where it is, got: {message}"
         );
         let sheet_pins = cse::Schematic::load(&root)
@@ -3613,9 +3693,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_sheet_pin_refuses_a_position_past_the_end_of_the_named_edge() {
-        // Measured against KiCad 10.0.6: a pin on the right edge's x but below
-        // the box was rewritten from `(at 130 140 0)` to `(at 130 100 0)` — the
-        // edge constrains the pin along its length as well as across it.
+        // Measured against KiCad 10.0.6, on a box whose right edge ran from
+        // (130, 50) to (130, 100): a pin on the right edge's x but below the box
+        // was rewritten from `(at 130 140 0)` to `(at 130 100 0)` — the edge
+        // constrains the pin along its length as well as across it.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
@@ -3623,7 +3704,7 @@ mod tests {
         let result = handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "PAST_END", "pin_type": "input",
-                     "x": 130.0, "y": 140.0, "side": "right" }),
+                     "x": 129.54, "y": 140.0, "side": "right" }),
             &ctx,
         )
         .await
@@ -3635,24 +3716,25 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            message.contains("past the end of the 'right' edge") && message.contains("to 100"),
+            message.contains("past the end of the 'right' edge") && message.contains("to 99.06"),
             "the refusal must say the edge ran out and where, got: {message}"
         );
     }
 
     #[tokio::test]
     async fn add_sheet_pin_accepts_a_pin_on_a_corner() {
-        // Both corners of an edge are on it: KiCad left `(at 130 50 0)` and
-        // `(at 130 100 0)` untouched, so the span check has to be inclusive.
+        // Both corners of an edge are on it: on a box with its right edge at
+        // x = 130, KiCad left `(at 130 50 0)` and `(at 130 100 0)` untouched,
+        // so the span check has to be inclusive.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
 
-        for (name, y) in [("TOP_CORNER", 50.0), ("BOTTOM_CORNER", 100.0)] {
+        for (name, y) in [("TOP_CORNER", 49.53), ("BOTTOM_CORNER", 99.06)] {
             let result = handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                          "pin_name": name, "pin_type": "input",
-                         "x": 130.0, "y": y, "side": "right" }),
+                         "x": 129.54, "y": y, "side": "right" }),
                 &ctx,
             )
             .await
@@ -3670,7 +3752,7 @@ mod tests {
         let result = handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "VCC", "pin_type": "input",
-                     "x": 130.0, "y": 55.0, "side": "north" }),
+                     "x": 129.54, "y": 55.0, "side": "north" }),
             &ctx,
         )
         .await
@@ -3704,7 +3786,7 @@ mod tests {
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
 
-        // (130, 50) is the top-right corner of the default box: the right
+        // (129.54, 49.53) is the top-right corner of the default box: the right
         // edge's x and the top edge's y, both exactly.
         for (name, side, expected_rotation) in
             [("CORNER_R", "right", 0.0), ("CORNER_T", "top", 90.0)]
@@ -3712,7 +3794,7 @@ mod tests {
             let result = handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                          "pin_name": name, "pin_type": "input",
-                         "x": 130.0, "y": 50.0, "side": side }),
+                         "x": 129.54, "y": 49.53, "side": side }),
                 &ctx,
             )
             .await
@@ -3743,7 +3825,7 @@ mod tests {
 
         // Inside SHEET_PIN_EDGE_TOLERANCE_MM, so the edge guard accepts it —
         // the subject here is the response, not a refusal.
-        let requested_x = 130.000_000_4_f64;
+        let requested_x = 129.540_000_4_f64;
         let requested_y = 55.000_000_4_f64;
         let result = handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
@@ -3788,13 +3870,13 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "CLK", "pin_type": "input",
-                     "x": 130.0, "y": 55.0, "side": "right" }),
+                     "x": 129.54, "y": 55.0, "side": "right" }),
             &ctx,
         )
         .await
         .unwrap();
 
-        let requested_x = 130.000_000_4_f64;
+        let requested_x = 129.540_000_4_f64;
         let requested_y = 60.000_000_4_f64;
         let result = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
@@ -3832,7 +3914,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "OLD", "pin_type": "input",
-                     "x": 130.0, "y": 55.0, "side": "right" }),
+                     "x": 129.54, "y": 55.0, "side": "right" }),
             &ctx,
         )
         .await
@@ -3860,7 +3942,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+                     "pin_name": "CLK", "pin_type": "input", "x": 129.54, "y": 55.0 }),
             &ctx,
         )
         .await
@@ -3868,7 +3950,7 @@ mod tests {
 
         let result = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "x": 65.0, "y": 100.0, "side": "bottom" }),
+                     "pin_name": "CLK", "x": 65.0, "y": 99.06, "side": "bottom" }),
             &ctx,
         )
         .await
@@ -3890,7 +3972,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+                     "pin_name": "CLK", "pin_type": "input", "x": 129.54, "y": 55.0 }),
             &ctx,
         )
         .await
@@ -3900,7 +3982,7 @@ mod tests {
         // Judged against the old position this would refuse, and it must not.
         let ok = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "x": 65.0, "y": 50.0, "side": "top" }),
+                     "pin_name": "CLK", "x": 65.0, "y": 49.53, "side": "top" }),
             &ctx,
         )
         .await
@@ -3934,7 +4016,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "pin_type": "input", "x": 130.0, "y": 55.0 }),
+                     "pin_name": "CLK", "pin_type": "input", "x": 129.54, "y": 55.0 }),
             &ctx,
         )
         .await
@@ -3951,7 +4033,7 @@ mod tests {
             (at.x, at.y)
         };
 
-        // Right edge (x 130) to left edge (x 50): same height.
+        // Right edge (x 129.54) to left edge (x 49.53): same height.
         let result = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "CLK", "side": "left" }),
@@ -3961,11 +4043,11 @@ mod tests {
         .unwrap();
         assert!(!result.is_error, "{result:?}");
         assert_eq!(pin_rotation(&root, "CLK"), Some(180.0));
-        assert_eq!(position(&root), (50.0, 55.0));
+        assert_eq!(position(&root), (49.53, 55.0));
         let changed = &result_json(&result)["changed_fields"];
         assert_eq!(changed, &json!(["position", "side"]), "{changed}");
 
-        // Left edge to bottom edge (y 100): x stays within the edge's 50..130.
+        // Left edge to bottom edge (y 99.06): x stays within the edge's 49.53..129.54.
         let result = handle_edit_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "CLK", "side": "bottom" }),
@@ -3975,7 +4057,7 @@ mod tests {
         .unwrap();
         assert!(!result.is_error, "{result:?}");
         assert_eq!(pin_rotation(&root, "CLK"), Some(270.0));
-        assert_eq!(position(&root), (50.0, 100.0));
+        assert_eq!(position(&root), (49.53, 99.06));
     }
 
     #[tokio::test]
@@ -3987,9 +4069,9 @@ mod tests {
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
         for (name, side, x, y) in [
-            ("R", "right", 130.0, 60.0),
-            ("B", "bottom", 90.0, 100.0),
-            ("L", "left", 50.0, 85.0),
+            ("R", "right", 129.54, 60.0),
+            ("B", "bottom", 90.0, 99.06),
+            ("L", "left", 49.53, 85.09),
         ] {
             let added = handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
@@ -4017,10 +4099,11 @@ mod tests {
         };
         let caption_before = caption_y(&root);
 
-        // 80 x 50 to 100 x 40: right edge 130 -> 150, bottom 100 -> 90.
+        // 80.01 x 49.53 to 100.33 x 39.37: right edge 129.54 -> 149.86, bottom
+        // 99.06 -> 88.9.
         let result = handle_edit_sheet(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 100.0, "height": 40.0 }),
+                     "width": 100.33, "height": 39.37 }),
             &ctx,
         )
         .await
@@ -4033,13 +4116,15 @@ mod tests {
             let pin = sheet.pin_by_name(name).unwrap();
             (pin.at.x, pin.at.y)
         };
-        assert_eq!(at("R"), (150.0, 60.0), "right-edge pin follows the edge");
-        assert_eq!(at("B"), (90.0, 90.0), "bottom-edge pin follows the edge");
-        assert_eq!(at("L"), (50.0, 85.0), "a left-edge pin stays put");
-        assert_eq!(
-            caption_y(&root),
-            caption_before - 10.0,
-            "caption stays under the box"
+        assert_eq!(at("R"), (149.86, 60.0), "right-edge pin follows the edge");
+        assert_eq!(at("B"), (90.0, 88.9), "bottom-edge pin follows the edge");
+        assert_eq!(at("L"), (49.53, 85.09), "a left-edge pin stays put");
+        // To the nanometre KiCad stores: the caption add_hierarchical_sheet
+        // writes is y + height + 0.635, which is not exact in binary.
+        let caption_after = caption_y(&root);
+        assert!(
+            (caption_after - (caption_before - 10.16)).abs() < 1e-6,
+            "caption stays under the box: {caption_before} -> {caption_after}"
         );
     }
 
@@ -4054,7 +4139,7 @@ mod tests {
         for (name, y) in [("P", 85.0), ("Q", 95.0)] {
             let added = handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                         "pin_name": name, "pin_type": "input", "side": "left", "x": 50.0, "y": y }),
+                         "pin_name": name, "pin_type": "input", "side": "left", "x": 49.53, "y": y }),
                 &ctx,
             )
             .await
@@ -4063,7 +4148,7 @@ mod tests {
         }
         let before = std::fs::read_to_string(&root).unwrap();
 
-        // Bottom 100 -> 80 would leave both pins below the box.
+        // Bottom 99.06 -> 80.01 (30 snaps to 30.48) would leave both pins below the box.
         let result = handle_edit_sheet(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "width": 80.0, "height": 30.0 }),
@@ -4097,7 +4182,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "CLK", "pin_type": "input", "x": 50.0, "y": 60.0 }),
+                     "pin_name": "CLK", "pin_type": "input", "x": 49.53, "y": 60.0 }),
             &ctx,
         )
         .await
@@ -4131,7 +4216,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "CLK", "pin_type": "input",
-                     "x": 60.0, "y": 100.0, "side": "bottom" }),
+                     "x": 60.0, "y": 99.06, "side": "bottom" }),
             &ctx,
         )
         .await
@@ -4189,7 +4274,7 @@ mod tests {
         for name in ["VIN", "GND"] {
             let pin = sheet.pin_by_name(name).unwrap();
             assert_eq!(pin.at.rotation, Some(90.0), "{name} must face the top edge");
-            assert_eq!(pin.at.y, 50.0, "{name} must sit on the top edge itself");
+            assert_eq!(pin.at.y, 49.53, "{name} must sit on the top edge itself");
         }
         // Stacked along the edge rather than piled on one point.
         assert_ne!(
@@ -4197,7 +4282,7 @@ mod tests {
             sheet.pin_by_name("GND").unwrap().at.x
         );
         assert!(
-            sheet.pins.iter().all(|p| p.at.x >= 50.0),
+            sheet.pins.iter().all(|p| p.at.x >= 49.53),
             "a top-edge stack runs across the box from its left corner"
         );
     }
@@ -4222,9 +4307,9 @@ mod tests {
 
         let parent = cse::Schematic::load(&root).unwrap();
         let sheet = parent.sheets.by_name("A").unwrap();
-        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.x, 50.0);
-        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.y, 52.54);
-        assert_eq!(sheet.pin_by_name("GND").unwrap().at.y, 55.08);
+        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.x, 49.53);
+        assert_eq!(sheet.pin_by_name("VIN").unwrap().at.y, 52.07);
+        assert_eq!(sheet.pin_by_name("GND").unwrap().at.y, 54.61);
         assert_eq!(sheet.pin_by_name("GND").unwrap().at.rotation, Some(180.0));
     }
 
@@ -4294,7 +4379,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "ODD", "pin_type": "passive",
-                     "x": 50.0, "y": 52.54, "side": "left" }),
+                     "x": 49.53, "y": 52.07, "side": "left" }),
             &ctx,
         )
         .await
@@ -4322,16 +4407,16 @@ mod tests {
             "an import must not stack over a pin whose edge it cannot determine"
         );
         assert_eq!(
-            vin.at.y, 55.08,
+            vin.at.y, 54.61,
             "the unattributable pin has to occupy a slot, so the import starts at the next one"
         );
     }
 
     #[tokio::test]
     async fn import_sheet_pins_refuses_a_left_edge_import_that_runs_past_the_corner() {
-        // The sheet box is 80 x 50 mm, so its left edge holds 19 pins at
+        // The sheet box is 80.01 x 49.53 mm, so its left edge holds 19 pins at
         // 2.54 mm. The nineteenth is the last that fits; the twentieth lands at
-        // y = 100.8, past the corner at y = 100, and KiCad would pull it back
+        // y = 100.33, past the corner at y = 99.06, and KiCad would pull it back
         // onto the corner. The import has to refuse before writing any of it.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
@@ -4366,8 +4451,8 @@ mod tests {
                 .unwrap()
                 .at
                 .y,
-            98.26,
-            "the last pin that fits sits 2.54 mm short of the corner"
+            97.79,
+            "the last pin that fits sits 1.27 mm short of the corner"
         );
 
         // One more label, and the edge is out of room.
@@ -4408,8 +4493,8 @@ mod tests {
 
     #[tokio::test]
     async fn import_sheet_pins_refuses_a_top_edge_import_that_runs_past_the_corner() {
-        // Same failure one axis over: the 80 mm top edge holds 31 pins, so the
-        // thirty-second lands at x = 131.28 against a corner at x = 130. This
+        // Same failure one axis over: the 80.01 mm top edge holds 31 pins, so the
+        // thirty-second lands at x = 130.81 against a corner at x = 129.54. This
         // one overflows from an empty sheet, so a loop that wrote as it went
         // would leave thirty-one pins behind — the assertion below is that the
         // file is untouched, not merely that an error came back.
@@ -4475,7 +4560,7 @@ mod tests {
             handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                          "pin_name": name, "pin_type": "input",
-                         "x": 130.0, "y": y, "side": "right" }),
+                         "x": 129.54, "y": y, "side": "right" }),
                 &ctx,
             )
             .await
@@ -4499,9 +4584,9 @@ mod tests {
             .pin_by_name("VIN")
             .unwrap()
             .clone();
-        assert_eq!(vin.at.x, 50.0);
+        assert_eq!(vin.at.x, 49.53);
         assert_eq!(
-            vin.at.y, 52.54,
+            vin.at.y, 52.07,
             "the left edge is empty, so the first imported pin takes its first slot"
         );
     }
@@ -4514,11 +4599,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
-        for (name, y) in [("A1", 52.54), ("A3", 57.62)] {
+        for (name, y) in [("A1", 52.07), ("A3", 57.15)] {
             handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                          "pin_name": name, "pin_type": "input",
-                         "x": 50.0, "y": y, "side": "left" }),
+                         "x": 49.53, "y": y, "side": "left" }),
                 &ctx,
             )
             .await
@@ -4545,7 +4630,7 @@ mod tests {
             "an import must not stack over a pin already on the selected edge"
         );
         assert_eq!(
-            vin.at.y, 60.16,
+            vin.at.y, 59.69,
             "the stack continues after the furthest pin on the edge, not after the count of them"
         );
     }
@@ -4553,18 +4638,20 @@ mod tests {
     #[tokio::test]
     async fn import_sheet_pins_reads_a_slot_the_division_cannot_represent_exactly() {
         // Deriving a slot from a coordinate is a division, and the spacing does
-        // not divide cleanly in binary: (62.7 - 50.0) / 2.54 is 5.000000000000001,
-        // so rounding outward without a tolerance reads slot 5 as slot 6 and the
-        // import skips a slot. It goes wrong at slots 5, 10, 12, 13, 17, 24, 26
-        // and 31 within one sheet; the other tests here sit on 1, 3 and 19, where
-        // the error happens to fall the harmless way, so none of them can see it.
+        // not divide cleanly in binary: (74.93 - 49.53) / 2.54 is
+        // 10.000000000000002, so rounding outward without a tolerance reads slot
+        // 10 as slot 11 and the import skips a slot. On this sheet's edges it
+        // goes wrong at slots 10, 12 and 31; the other tests here sit on 1, 2, 3
+        // and 19, where the error happens to fall the harmless way, so apart from
+        // the unattributable pin the walk test parks on slot 10, none of them can
+        // see it.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "pin_name": "FIFTH", "pin_type": "input",
-                     "x": 50.0, "y": 62.7, "side": "left" }),
+                     "pin_name": "TENTH", "pin_type": "input",
+                     "x": 49.53, "y": 74.93, "side": "left" }),
             &ctx,
         )
         .await
@@ -4589,8 +4676,8 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(
-            vin.at.y, 65.24,
-            "a pin on slot 5 must be read as slot 5, so the import takes slot 6"
+            vin.at.y, 77.47,
+            "a pin on slot 10 must be read as slot 10, so the import takes slot 11"
         );
     }
 
@@ -4610,13 +4697,14 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "DEEP", "pin_type": "input",
-                     "x": 50.0, "y": 98.26, "side": "left" }),
+                     "x": 49.53, "y": 97.79, "side": "left" }),
             &ctx,
         )
         .await
         .unwrap();
-        // The 50 mm left edge becomes a 20 mm one; DEEP is now off the box.
-        shrink_without_moving_pins(&root, 20.0);
+        // The 49.53 mm left edge becomes a 19.05 mm one; DEEP is now off the box.
+        // That is 7.5 slots, so the new corner is not itself a slot.
+        shrink_without_moving_pins(&root, 19.05);
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
@@ -4641,7 +4729,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(
-            vin.at.y, 52.54,
+            vin.at.y, 52.07,
             "the stranded pin cannot say where the stack ends, and the slots it and its clamp \
              point occupy are both off the shortened edge, so the first slot is genuinely free"
         );
@@ -4660,7 +4748,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "LAST", "pin_type": "input",
-                     "x": 50.0, "y": 98.26, "side": "left" }),
+                     "x": 49.53, "y": 97.79, "side": "left" }),
             &ctx,
         )
         .await
@@ -4699,13 +4787,15 @@ mod tests {
         // The reserve used to be a COUNT. It stepped the stack past one slot per
         // unattributable pin, wherever that pin actually sat, so a single-label
         // import cleared it and a multi-label import walked straight over it.
+        // ODD sits on slot 10, one of the slots the division overshoots, so the
+        // walk also goes over it if that slot is misread as slot 11.
         let tmp = TempDir::new().unwrap();
         let ctx = test_ctx();
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "ODD", "pin_type": "passive",
-                     "x": 50.0, "y": 62.7, "side": "left" }),
+                     "x": 49.53, "y": 74.93, "side": "left" }),
             &ctx,
         )
         .await
@@ -4713,8 +4803,8 @@ mod tests {
         set_pin_rotation(&root, "ODD", None);
 
         let child_path = tmp.path().join("a.kicad_sch");
-        for n in ["N1", "N2", "N3", "N4", "N5"] {
-            add_label(&child_path, n, "input", 5.0, 5.0);
+        for n in 1..=10 {
+            add_label(&child_path, &format!("N{n}"), "input", 5.0, 5.0);
         }
         let result = handle_import_sheet_pins(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "side": "left" }),
@@ -4726,7 +4816,7 @@ mod tests {
 
         let parent = cse::Schematic::load(&root).unwrap();
         let sheet = parent.sheets.by_name("A").unwrap();
-        assert_eq!(sheet.pins.len(), 6, "all five labels were imported");
+        assert_eq!(sheet.pins.len(), 11, "all ten labels were imported");
         let odd = sheet.pin_by_name("ODD").unwrap().clone();
         let on_top: Vec<_> = sheet
             .pins
@@ -4745,7 +4835,7 @@ mod tests {
 
     #[tokio::test]
     async fn sheet_pin_edge_capacity_counts_an_exact_multiple_span() {
-        // (50.0 + 5.08) - 50.0 is 5.079999999999998, so an untoleranced floor()
+        // (49.53 + 5.08) - 49.53 is 5.079999999999998, so an untoleranced floor()
         // reads a two-slot edge as one. The undercount decides which pins count
         // as being on the edge, so it stranded a valid pin and let an import
         // write over it.
@@ -4754,7 +4844,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_edit_sheet(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 5.08 }),
+                     "width": 80.01, "height": 5.08 }),
             &ctx,
         )
         .await
@@ -4775,7 +4865,7 @@ mod tests {
         let root = sheet_for_pins(&tmp, &ctx).await;
         handle_edit_sheet(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 5.08 }),
+                     "width": 80.01, "height": 5.08 }),
             &ctx,
         )
         .await
@@ -4783,7 +4873,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "LAST", "pin_type": "input",
-                     "x": 50.0, "y": 55.08, "side": "left" }),
+                     "x": 49.53, "y": 54.61, "side": "left" }),
             &ctx,
         )
         .await
@@ -4831,7 +4921,7 @@ mod tests {
         handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "STRANDED", "pin_type": "input",
-                     "x": 50.0, "y": 60.0, "side": "left" }),
+                     "x": 49.53, "y": 60.0, "side": "left" }),
             &ctx,
         )
         .await
@@ -4876,7 +4966,7 @@ mod tests {
         let added = handle_add_sheet_pin(
             &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
                      "pin_name": "P", "pin_type": "input",
-                     "x": 50.0, "y": 60.0, "side": "left" }),
+                     "x": 49.53, "y": 60.0, "side": "left" }),
             &ctx,
         )
         .await
@@ -4887,7 +4977,7 @@ mod tests {
         // discarded the result; once that call began refusing, the sheet stayed
         // rectangular and this test passed while exercising nothing.
         let written = std::fs::read_to_string(&root).unwrap();
-        let inverted = written.replace("(size 80 50)", "(size 80 -20)");
+        let inverted = written.replace("(size 80.01 49.53)", "(size 80.01 -20)");
         assert_ne!(
             inverted, written,
             "fixture: the sheet's size literal was not found, so the span was never inverted"
@@ -5085,7 +5175,7 @@ mod tests {
         // Label with no pin, and (below) a pin with no label — deliberate mismatch.
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
         handle_add_sheet_pin(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "pin_name": "GND", "pin_type": "passive", "x": 130.0, "y": 55.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "Power", "pin_name": "GND", "pin_type": "passive", "x": 129.54, "y": 55.0 }),
             &ctx,
         )
         .await
@@ -5167,16 +5257,16 @@ mod tests {
         let before = std::fs::read_to_string(&root).unwrap();
         HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
             *fault.borrow_mut() = Some(HierarchyProspectiveFault::Replace {
-                from: "(at 75 80)".to_owned(),
-                to: "(at 76 80)".to_owned(),
+                from: "(at 74.93 80.01)".to_owned(),
+                to: "(at 76.2 80.01)".to_owned(),
             });
         });
         let refusal = handle_move_sheet(
             &json!({
                 "schematic": root.display().to_string(),
                 "sheet_name": "test",
-                "x": 75.0,
-                "y": 80.0,
+                "x": 74.93,
+                "y": 80.01,
             }),
             &ctx,
         )
