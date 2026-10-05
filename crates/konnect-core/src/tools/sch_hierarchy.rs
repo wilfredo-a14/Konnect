@@ -1334,6 +1334,32 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     }
     if let (Some(w), Some(h)) = (requested_width, requested_height) {
         requested.push("size");
+        // Like eeschema, never shrink the box past a pin: clamping two pins
+        // onto the same corner would join their nets on the parent sheet.
+        let (left, top) = sheet.position();
+        let stranded: Vec<String> = sheet
+            .pins
+            .iter()
+            .filter(|pin| {
+                let rotation = pin.at.rotation.unwrap_or(0.0).rem_euclid(360.0).round();
+                if rotation == 0.0 || rotation == 180.0 {
+                    pin.at.y > top + h
+                } else {
+                    pin.at.x > left + w
+                }
+            })
+            .map(|pin| format!("{} at ({}, {})", pin.name, pin.at.x, pin.at.y))
+            .collect();
+        if !stranded.is_empty() {
+            return Ok(invalid_arg(
+                "width",
+                &format!(
+                    "a {w} x {h} box would leave pins past its edges: {}. Move or delete \
+                     those pins first, or keep the box large enough to hold them.",
+                    stranded.join(", ")
+                ),
+            ));
+        }
         if sheet.width != w || sheet.height != h {
             sheet.set_size(w, h);
             changed.push("size");
@@ -3467,6 +3493,15 @@ mod tests {
         root
     }
 
+    /// Shrink sheet A's height in the file without touching its pins: the
+    /// stranded-pin state edit_sheet now refuses to create, but which files
+    /// written by hand or by older tools can still hold.
+    fn shrink_without_moving_pins(root: &Path, height: f64) {
+        let mut parent = cse::Schematic::load(root).unwrap();
+        parent.sheets.by_name_mut("A").unwrap().height = height;
+        parent.overwrite().unwrap();
+    }
+
     fn pin_rotation(root: &Path, pin_name: &str) -> Option<f64> {
         cse::Schematic::load(root)
             .unwrap()
@@ -3954,7 +3989,7 @@ mod tests {
         for (name, side, x, y) in [
             ("R", "right", 130.0, 60.0),
             ("B", "bottom", 90.0, 100.0),
-            ("L", "left", 50.0, 95.0),
+            ("L", "left", 50.0, 85.0),
         ] {
             let added = handle_add_sheet_pin(
                 &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
@@ -4000,15 +4035,55 @@ mod tests {
         };
         assert_eq!(at("R"), (150.0, 60.0), "right-edge pin follows the edge");
         assert_eq!(at("B"), (90.0, 90.0), "bottom-edge pin follows the edge");
-        assert_eq!(
-            at("L"),
-            (50.0, 90.0),
-            "a pin past the new corner is pulled in"
-        );
+        assert_eq!(at("L"), (50.0, 85.0), "a left-edge pin stays put");
         assert_eq!(
             caption_y(&root),
             caption_before - 10.0,
             "caption stays under the box"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_refuses_to_shrink_the_box_past_a_pin() {
+        // Clamping a stranded pin onto the new edge can stack two pins on one
+        // point, joining their nets on the parent sheet. eeschema never lets a
+        // sheet shrink past its pins; neither does edit_sheet.
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_for_pins(&tmp, &ctx).await;
+        for (name, y) in [("P", 85.0), ("Q", 95.0)] {
+            let added = handle_add_sheet_pin(
+                &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                         "pin_name": name, "pin_type": "input", "side": "left", "x": 50.0, "y": y }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!added.is_error, "{added:?}");
+        }
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        // Bottom 100 -> 80 would leave both pins below the box.
+        let result = handle_edit_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
+                     "width": 80.0, "height": 30.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let message = result_json(&result)["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("P at") && message.contains("Q at"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            before,
+            "nothing written"
         );
     }
 
@@ -4521,8 +4596,9 @@ mod tests {
 
     #[tokio::test]
     async fn import_sheet_pins_ignores_a_pin_the_sheet_shrank_away_from() {
-        // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
-        // strands them past the new corner. Such a pin names the edge but is not
+        // A sheet shrunk without its pins moving (as edit_sheet did before it
+        // refused that, and as a hand edit can) strands them past the new
+        // corner. Such a pin names the edge but is not
         // on it, and measuring it would report the edge filled through a slot it
         // no longer has — refusing an import onto an edge that holds no valid pin
         // at all. Its coordinate still blocks a slot, and so does the corner
@@ -4540,13 +4616,7 @@ mod tests {
         .await
         .unwrap();
         // The 50 mm left edge becomes a 20 mm one; DEEP is now off the box.
-        handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 20.0 }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        shrink_without_moving_pins(&root, 20.0);
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
@@ -4766,13 +4836,7 @@ mod tests {
         )
         .await
         .unwrap();
-        handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 5.08 }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        shrink_without_moving_pins(&root, 5.08);
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "ONE", "input", 5.0, 5.0);
