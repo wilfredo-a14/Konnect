@@ -51,6 +51,11 @@ impl McpProcess {
         env: &[(&str, &str)],
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        // A test server must never find the developer's running KiCad: it would
+        // report every test call to its API Activity panel.
+        if !env.iter().any(|(key, _)| *key == "KICAD_API_SOCKET") {
+            command.env("KICAD_API_SOCKET", "ipc:///tmp/konnect-tests-no-kicad.sock");
+        }
         for (key, value) in env {
             command.env(key, value);
         }

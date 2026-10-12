@@ -47,6 +47,67 @@ message GetOpenDocumentsResponse
   repeated kiapi.common.types.DocumentSpecifier documents = 1;
 }
 
+enum DocumentModifiedState
+{
+  DMS_UNKNOWN    = 0;
+  DMS_UNMODIFIED = 1;
+  DMS_MODIFIED   = 2;
+}
+
+// Checks whether a document currently open in an editor or headless context has unsaved changes
+message GetDocumentModifiedState
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+message GetDocumentModifiedStateResponse
+{
+  DocumentModifiedState state = 1;
+}
+
+// fredo fork only: shows where an API client just edited. Brightens the given items (display
+// state only: not a selection, not saved), switching to the sheet that holds the first one found
+// and scrolling to them if they are out of view. Replaces the previous highlight; an empty list
+// clears it. Items on other sheets than the first one found are not highlighted.
+message HighlightItems
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  repeated kiapi.common.types.KIID items = 2;
+
+  // What the client did, shown beside the agent cursor and in the API Activity log, such as
+  // "Edit R101: value 10k".  When empty, KiCad names the highlighted items instead.
+  string label = 3;
+
+  // Highlighted items that moved.  The agent cursor shows each one dragged from its old place.
+  repeated MovedItem moved = 4;
+}
+
+message MovedItem
+{
+  kiapi.common.types.KIID item = 1;
+
+  // Where the item was, in the same units as the document's other API positions
+  kiapi.common.types.Vector2 from = 2;
+}
+
+message HighlightItemsResponse
+{
+  // How many of the requested items were found and highlighted
+  int32 highlighted = 1;
+}
+
+// fredo fork only: opens an editor window, or brings it to the front, as the project manager's
+// launcher buttons do; the schematic and PCB editors load the open project's schematic or board.
+// Handled by the project manager. Fails instead of asking when no project is open or the
+// project has no such file. Returns Empty.
+message OpenEditor
+{
+  // FT_PROJECT_MANAGER, FT_SCHEMATIC_EDITOR, FT_PCB_EDITOR, FT_SYMBOL_EDITOR or
+  // FT_FOOTPRINT_EDITOR
+  kiapi.common.types.FrameType frame = 1;
+}
+
 message SaveDocument
 {
   kiapi.common.types.DocumentSpecifier document = 1;
@@ -96,6 +157,14 @@ message RevertDocument
 message RunAction
 {
   string action = 1;  // Action name, like "eeschema.InteractiveSelection.ClearSelection"
+
+  // fredo's-kicad only: run the action after replying.  For actions that open a modal dialog,
+  // such as Preferences or Board Setup, which would otherwise hold the reply until it closes.
+  bool deferred = 2;
+
+  // fredo's-kicad only: the editor to run it in.  Unset runs it in whichever open editor knows
+  // the action; with several open, that is not predictable for actions they all have.
+  kiapi.common.types.FrameType frame = 3;
 }
 
 enum RunActionStatus
@@ -444,4 +513,82 @@ message ParseAndCreateItemsFromString
   kiapi.common.types.DocumentSpecifier document = 1;
 
   string contents = 2;
+}
+
+// fredo's-kicad only: run a design check in the editor as a person would, with the agent cursor
+// showing the clicks.  Opens the DRC dialog for a board or the ERC dialog for a schematic and
+// clicks its Run button.  Replies as soon as the run has started; the results stay in the
+// dialog, and the API Activity log gets a line with the counts when the run finishes.
+message RunChecker
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+message RunCheckerResponse
+{
+  bool started = 1;
+}
+
+// fredo's-kicad only: click OK or Cancel on the frontmost dialog, with the agent cursor
+// showing the click.  Handled by the project manager.
+message CloseDialog
+{
+  // "ok" or "cancel"
+  string button = 1;
+}
+
+message CloseDialogResponse
+{
+  bool found = 1;
+
+  // The dialog's title, when one was found
+  string title = 2;
+}
+
+message FieldEdit
+{
+  // The field's name as the Properties dialog lists it, e.g. "Datasheet" or "MPN"
+  string name = 1;
+
+  string value = 2;
+}
+
+// fredo's-kicad only: open an item's Properties dialog as a person would (select it, open the
+// dialog), type new values into its field grid with the agent cursor on each cell, and click
+// OK.  Footprints on a board and symbols on a schematic.  Replies once the dialog is opening;
+// each step is logged as it happens.  A field the dialog does not list stops the edit and the
+// dialog is cancelled.
+message EditItemProperties
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  kiapi.common.types.KIID item = 2;
+
+  repeated FieldEdit fields = 3;
+}
+
+message EditItemPropertiesResponse
+{
+  bool started = 1;
+}
+
+// fredo's-kicad only: save what the 3D viewer shows as a PNG at this path.  Handled by the 3D
+// viewer; fails when it is not open.
+message Capture3DView
+{
+  string path = 1;
+}
+
+message Capture3DViewResponse
+{
+  int32 width = 1;
+
+  int32 height = 2;
+}
+
+// fredo's-kicad only: load a footprint from a library into the footprint editor, as its library
+// tree does.  Returns Empty.
+message OpenFootprint
+{
+  kiapi.common.types.LibraryIdentifier lib_id = 1;
 }

@@ -23,6 +23,102 @@ use super::navigation_target::{
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
+            "open_editor",
+            "Open a KiCad editor window, or bring it to the front, as the project manager's launcher buttons do: 'schematic' and 'pcb' load the open project's schematic or board, 'symbol' and 'footprint' open the library editors, '3d' opens the 3D viewer from the PCB editor (which must be open), 'project' raises the project manager. Works whichever KiCad window is in front. Needs the fredo KiCad fork; refuses instead of prompting when no project is open or the project has no such file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "editor": { "type": "string", "enum": ["project", "schematic", "pcb", "symbol", "footprint", "3d"] }
+                },
+                "required": ["editor"]
+            }),
+            |args, ctx| async move { handle_open_editor(args, ctx).await }
+        ),
+        tool!(
+            "run_editor_action",
+            "Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does, e.g. 'common.Control.zoomFitScreen', 'pcbnew.EditorControl.boardSetup', 'eeschema.EditorControl.schematicSetup' or 'common.SuiteControl.openPreferences'. Set deferred for actions that open a modal dialog (setup and preferences dialogs), so KiCad replies before the dialog blocks; close it afterwards with close_dialog. The agent cursor points at the button. Needs the fredo KiCad fork for deferred actions and schematic actions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "editor": { "type": "string", "enum": ["pcb", "schematic", "footprint", "3d"] },
+                    "action": { "type": "string", "description": "The action name, e.g. common.Control.zoomFitScreen, or 3DViewer.Control.viewTop in the 3D viewer" },
+                    "deferred": { "type": "boolean", "description": "Run after KiCad replies; required for actions that open a modal dialog", "default": false }
+                },
+                "required": ["editor", "action"]
+            }),
+            |args, ctx| async move { handle_run_editor_action(args, ctx).await }
+        ),
+        tool!(
+            "run_checker",
+            "Run the design check in the open editor as a person would: DRC in the PCB editor or ERC in the schematic editor. Opens the checker dialog, clicks Run, and leaves the results on screen; the API Activity log gets the error and warning counts when the run finishes. Returns once the run has started. Needs the fredo KiCad fork and the editor open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "editor": { "type": "string", "enum": ["pcb", "schematic"] }
+                },
+                "required": ["editor"]
+            }),
+            |args, ctx| async move { handle_run_checker(args, ctx).await }
+        ),
+        tool!(
+            "close_dialog",
+            "Click OK or Cancel on the frontmost KiCad dialog, as a person would, with the agent cursor on the button. Use it to dismiss a dialog opened with run_editor_action or left by run_checker. Reports whether a dialog was found and its title. Needs the fredo KiCad fork.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "button": { "type": "string", "enum": ["ok", "cancel"] }
+                },
+                "required": ["button"]
+            }),
+            |args, ctx| async move { handle_close_dialog(args, ctx).await }
+        ),
+        tool!(
+            "capture_3d_view",
+            "Save what KiCad's 3D viewer currently shows as a PNG at an absolute path, so the rendered board can be looked at without a screenshot. Open the viewer first with open_editor('3d') and set the view with run_editor_action('3d', '3DViewer.Control.viewTop' etc.). Needs the fredo KiCad fork and the 3D viewer open on screen.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute .png path in an existing folder" }
+                },
+                "required": ["path"]
+            }),
+            |args, ctx| async move { handle_capture_3d_view(args, ctx).await }
+        ),
+        tool!(
+            "open_footprint_editor",
+            "Load a footprint from a library into KiCad's footprint editor, as its library tree does, for example library 'Resistor_SMD' and name 'R_0603_1608Metric'. The editor's items (pads, graphics, fields) are then reachable through the board item API, and save_footprint writes it back. Refused while the editor holds unsaved changes. Needs the fredo KiCad fork; opens the editor if it is closed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library": { "type": "string", "description": "Library nickname, e.g. Resistor_SMD" },
+                    "name": { "type": "string", "description": "Footprint name, e.g. R_0603_1608Metric" }
+                },
+                "required": ["library", "name"]
+            }),
+            |args, ctx| async move { handle_open_footprint_editor(args, ctx).await }
+        ),
+        tool!(
+            "save_footprint",
+            "Save the footprint the footprint editor holds back to its library, as its Save button does. Needs the fredo KiCad fork and the footprint editor open.",
+            json!({ "type": "object", "properties": {}, "required": [] }),
+            |args, ctx| async move { handle_save_footprint(args, ctx).await }
+        ),
+        tool!(
+            "edit_item_properties",
+            "Edit a part through its Properties dialog as a person would: select the footprint (PCB) or symbol (schematic), open its Properties dialog, type each field's new value into the field grid with the agent cursor on the cell, and click OK. Field names are as the dialog lists them, e.g. Datasheet, MPN, Value. A field the dialog does not list cancels the dialog. The schematic form needs the sheet file that holds the symbol. Returns once the dialog is opening; each step is in the API Activity log. Needs the fredo KiCad fork and the editor open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "editor": { "type": "string", "enum": ["pcb", "schematic"] },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. R101" },
+                    "schematic": { "type": "string", "description": "Path of the .kicad_sch sheet holding the symbol (schematic only)" },
+                    "fields": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Field name to new value" }
+                },
+                "required": ["editor", "reference", "fields"]
+            }),
+            |args, ctx| async move { handle_edit_item_properties(args, ctx).await }
+        ),
+        tool!(
             "get_editor_state",
             "Observe the configured KiCad IPC endpoint: running KiCad version, addressable schematic and PCB editors, exact open document identities, and semantic navigation capabilities. Active editor/document/sheet fields are null when KiCad has no stable typed query; open-document order is never treated as active state.",
             json!({
@@ -111,6 +207,422 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_resolve_cross_probe_target(args, ctx).await }
         ),
     ]
+}
+
+async fn handle_open_editor(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::FrameType;
+
+    let editor = match require_str(args, "editor") {
+        Ok(editor) => editor.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let frame = match editor.as_str() {
+        "project" => FrameType::FtProjectManager,
+        "schematic" => FrameType::FtSchematicEditor,
+        "pcb" => FrameType::FtPcbEditor,
+        "symbol" => FrameType::FtSymbolEditor,
+        "footprint" => FrameType::FtFootprintEditor,
+        "3d" => FrameType::Ft3dViewer,
+        _ => {
+            return Ok(invalid_arg(
+                "editor",
+                "expected 'project', 'schematic', 'pcb', 'symbol', 'footprint' or '3d'",
+            ))
+        }
+    };
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).open_editor(frame)
+    })
+    .await?;
+    match result {
+        Ok(()) => Ok(CallToolResult::json(&json!({ "opened": editor }))),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not open the {editor} editor: {error:#}"
+        ))),
+    }
+}
+
+fn frame_for(editor: &str) -> Option<konnect_ipc::gen::kiapi::common::types::FrameType> {
+    use konnect_ipc::gen::kiapi::common::types::FrameType;
+    match editor {
+        "pcb" => Some(FrameType::FtPcbEditor),
+        "schematic" => Some(FrameType::FtSchematicEditor),
+        "footprint" => Some(FrameType::FtFootprintEditor),
+        "3d" => Some(FrameType::Ft3dViewer),
+        _ => None,
+    }
+}
+
+fn kind_for(editor: &str) -> Option<konnect_ipc::IpcEditorKind> {
+    match editor {
+        "pcb" => Some(konnect_ipc::IpcEditorKind::Pcb),
+        "schematic" => Some(konnect_ipc::IpcEditorKind::Schematic),
+        _ => None,
+    }
+}
+
+/// The first document the editor of `kind` holds open, or the refusal to return.
+fn open_document(
+    client: &konnect_ipc::KiCadIpcClient,
+    kind: konnect_ipc::IpcEditorKind,
+) -> Result<konnect_ipc::gen::kiapi::common::types::DocumentSpecifier, CallToolResult> {
+    match client.get_open_documents_for(kind) {
+        Ok(documents) => documents.into_iter().next().ok_or_else(|| {
+            editor_unavailable(&format!(
+                "the {} editor holds no open document; open it first",
+                kind.as_str()
+            ))
+        }),
+        Err(error) => Err(editor_unavailable(&format!(
+            "KiCad did not list the {} editor's documents: {error:#}",
+            kind.as_str()
+        ))),
+    }
+}
+
+async fn handle_run_editor_action(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let editor = match require_str(args, "editor") {
+        Ok(editor) => editor.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(frame) = frame_for(&editor) else {
+        return Ok(invalid_arg(
+            "editor",
+            "expected 'pcb', 'schematic', 'footprint' or '3d'",
+        ));
+    };
+    let action = match require_str(args, "action") {
+        Ok(action) => action.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let deferred = args
+        .get("deferred")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+
+    let action_ipc = action.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).run_action_in(frame, &action_ipc, deferred)
+    })
+    .await?;
+    match result {
+        Ok(true) => Ok(CallToolResult::json(&json!({
+            "ran": action,
+            "editor": editor,
+            "deferred": deferred,
+            "note": if deferred { "KiCad runs the action right after this reply; a dialog it opens stays open until close_dialog or the person closes it" } else { "the action ran" }
+        }))),
+        Ok(false) => Ok(invalid_arg(
+            "action",
+            &format!("the {editor} editor has no action named '{action}'"),
+        )),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not run '{action}' in the {editor} editor: {error:#}"
+        ))),
+    }
+}
+
+async fn handle_run_checker(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let editor = match require_str(args, "editor") {
+        Ok(editor) => editor.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(kind) = kind_for(&editor) else {
+        return Ok(invalid_arg("editor", "expected 'pcb' or 'schematic'"));
+    };
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+    let checker = if kind == konnect_ipc::IpcEditorKind::Pcb {
+        "DRC"
+    } else {
+        "ERC"
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let client = konnect_ipc::KiCadIpcClient::new(address);
+        let document = open_document(&client, kind)?;
+        client.run_checker(document).map_err(|error| {
+            editor_unavailable(&format!("KiCad did not start the {checker}: {error:#}"))
+        })
+    })
+    .await?;
+    match result {
+        Ok(started) => Ok(CallToolResult::json(&json!({
+            "checker": checker,
+            "started": started,
+            "note": "the results stay in the checker dialog; the API Activity log reports the counts when the run finishes"
+        }))),
+        Err(refusal) => Ok(refusal),
+    }
+}
+
+async fn handle_close_dialog(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let button = match require_str(args, "button") {
+        Ok(button) if matches!(button, "ok" | "cancel") => button.to_string(),
+        Ok(_) => return Ok(invalid_arg("button", "expected 'ok' or 'cancel'")),
+        Err(error) => return Ok(error),
+    };
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+
+    let button_ipc = button.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).close_dialog(&button_ipc)
+    })
+    .await?;
+    match result {
+        Ok((true, title)) => Ok(CallToolResult::json(&json!({
+            "closed_with": button,
+            "dialog": title
+        }))),
+        Ok((false, _)) => Ok(CallToolResult::json(&json!({
+            "closed_with": serde_json::Value::Null,
+            "dialog": serde_json::Value::Null,
+            "note": "no dialog is open"
+        }))),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not close the dialog: {error:#}"
+        ))),
+    }
+}
+
+async fn handle_capture_3d_view(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = match require_str(args, "path") {
+        Ok(path) => path.to_string(),
+        Err(error) => return Ok(error),
+    };
+    if !std::path::Path::new(&path).is_absolute() {
+        return Ok(invalid_arg("path", "must be an absolute path"));
+    }
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+    let path_ipc = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).capture_3d_view(&path_ipc)
+    })
+    .await?;
+    match result {
+        Ok((width, height)) => Ok(CallToolResult::json(&json!({
+            "path": path,
+            "width": width,
+            "height": height
+        }))),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not save the 3D view: {error:#}. Open the 3D viewer first (open_editor '3d')."
+        ))),
+    }
+}
+
+async fn handle_open_footprint_editor(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::FrameType;
+
+    let library = match require_str(args, "library") {
+        Ok(library) => library.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let name = match require_str(args, "name") {
+        Ok(name) => name.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+    let (library_ipc, name_ipc) = (library.clone(), name.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        let client = konnect_ipc::KiCadIpcClient::new(address);
+        // The editor must exist before it can load anything
+        client.open_editor(FrameType::FtFootprintEditor)?;
+        client.open_footprint(&library_ipc, &name_ipc)
+    })
+    .await?;
+    match result {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "opened": format!("{library}:{name}"),
+            "editor": "footprint"
+        }))),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not open {library}:{name} in the footprint editor: {error:#}"
+        ))),
+    }
+}
+
+async fn handle_save_footprint(
+    _args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).save_footprint()
+    })
+    .await?;
+    match result {
+        Ok(()) => Ok(CallToolResult::json(&json!({ "saved": true }))),
+        Err(error) => Ok(editor_unavailable(&format!(
+            "KiCad did not save the footprint: {error:#}"
+        ))),
+    }
+}
+
+async fn handle_edit_item_properties(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let editor = match require_str(args, "editor") {
+        Ok(editor) => editor.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(kind) = kind_for(&editor) else {
+        return Ok(invalid_arg("editor", "expected 'pcb' or 'schematic'"));
+    };
+    let reference = match require_str(args, "reference") {
+        Ok(reference) => reference.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let fields: Vec<(String, String)> =
+        match args.get("fields").and_then(serde_json::Value::as_object) {
+            Some(map) if !map.is_empty() => map
+                .iter()
+                .filter_map(|(name, value)| value.as_str().map(|v| (name.clone(), v.to_string())))
+                .collect(),
+            _ => {
+                return Ok(invalid_arg(
+                    "fields",
+                    "an object of field name to new value, with at least one field",
+                ))
+            }
+        };
+    if fields.is_empty() {
+        return Ok(invalid_arg("fields", "every value must be a string"));
+    }
+
+    // A symbol's KIID comes from the saved sheet; KiCad resolves it on the sheet it belongs to
+    let symbol_kiid = if kind == konnect_ipc::IpcEditorKind::Schematic {
+        let sch_path = match args.get("schematic").and_then(serde_json::Value::as_str) {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                return Ok(invalid_arg(
+                    "schematic",
+                    "the .kicad_sch sheet holding the symbol is needed",
+                ))
+            }
+        };
+        let sheet = match konnect_schematic_editor::schematic::Schematic::load(&sch_path) {
+            Ok(sheet) => sheet,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "could not read '{}': {error:#}",
+                    sch_path.display()
+                )))
+            }
+        };
+        match sheet
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+            .min_by_key(|symbol| symbol.unit)
+        {
+            Some(symbol) => Some(symbol.uuid.clone()),
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "'{reference}' is not on '{}'",
+                    sch_path.display()
+                )))
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+
+    let reference_ipc = reference.clone();
+    let fields_ipc = fields.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = konnect_ipc::KiCadIpcClient::new(address);
+        let document = open_document(&client, kind)?;
+        let kiid = match symbol_kiid {
+            Some(kiid) => kiid,
+            None => match client.footprint_kiid(&reference_ipc) {
+                Ok(Some(kiid)) => kiid,
+                Ok(None) => {
+                    return Err(CallToolResult::error(format!(
+                        "'{reference_ipc}' is not on the open board"
+                    )))
+                }
+                Err(error) => {
+                    return Err(editor_unavailable(&format!(
+                        "KiCad did not list the board's footprints: {error:#}"
+                    )))
+                }
+            },
+        };
+        client
+            .edit_item_properties(document, &kiid, &fields_ipc)
+            .map_err(|error| {
+                editor_unavailable(&format!(
+                    "KiCad did not open the Properties dialog of {reference_ipc}: {error:#}"
+                ))
+            })
+    })
+    .await?;
+    match result {
+        Ok(started) => Ok(CallToolResult::json(&json!({
+            "reference": reference,
+            "editor": editor,
+            "fields": fields.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect::<Vec<_>>(),
+            "started": started,
+            "note": "the dialog is being worked on screen; the API Activity log shows each field typed and the OK click"
+        }))),
+        Err(refusal) => Ok(refusal),
+    }
 }
 
 async fn handle_get_editor_state(
@@ -1228,7 +1740,12 @@ mod tests {
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 5);
+        assert_eq!(definitions.len(), 13);
+        let open = definitions
+            .iter()
+            .find(|tool| tool.name == "open_editor")
+            .expect("open tool");
+        assert_eq!(open.input_schema["required"], json!(["editor"]));
         let state = definitions
             .iter()
             .find(|tool| tool.name == "get_editor_state")
@@ -1637,5 +2154,319 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("unresolved_cross_probe_destination")
         );
+    }
+}
+
+#[cfg(test)]
+mod dialog_tool_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::router::ToolRouter;
+    use crate::test_support::MockIpcServer;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    fn context(ipc_address: String) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).expect("json result")
+    }
+
+    fn ok(message: Option<prost_types::Any>) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message,
+        }
+    }
+
+    fn pcb_document() -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "/p/b.kicad_pcb".to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// A fredo-fork KiCad holding one board, recording every request it is sent
+    fn spawn_fork(requests: Arc<Mutex<Vec<prost_types::Any>>>) -> MockIpcServer {
+        MockIpcServer::spawn("dialog-fork", move |request| {
+            let command = request.message.expect("a command");
+            requests.lock().unwrap().push(command.clone());
+            let name = command.type_url.rsplit('.').next().unwrap().to_string();
+            match name.as_str() {
+                "GetOpenDocuments" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![pcb_document()],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                ))),
+                "RunAction" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::RunActionResponse {
+                        status: kiapi::common::commands::RunActionStatus::RasOk as i32,
+                    },
+                    "kiapi.common.commands.RunActionResponse",
+                ))),
+                "RunChecker" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::RunCheckerResponse { started: true },
+                    "kiapi.common.commands.RunCheckerResponse",
+                ))),
+                "CloseDialog" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::CloseDialogResponse {
+                        found: true,
+                        title: "Board Setup".to_string(),
+                    },
+                    "kiapi.common.commands.CloseDialogResponse",
+                ))),
+                "GetItems" => {
+                    let footprint = kiapi::board::types::FootprintInstance {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "fp-r101".to_string(),
+                        }),
+                        reference_field: Some(kiapi::board::types::Field {
+                            text: Some(kiapi::board::types::BoardText {
+                                text: Some(kiapi::common::types::Text {
+                                    text: "R101".to_string(),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    ok(Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: vec![konnect_ipc::builders::pack_any(
+                                &footprint,
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                "Capture3DView" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::Capture3DViewResponse {
+                        width: 1280,
+                        height: 720,
+                    },
+                    "kiapi.common.commands.Capture3DViewResponse",
+                ))),
+                "OpenEditor" | "OpenFootprint" => ok(None),
+                "EditItemProperties" => ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::EditItemPropertiesResponse { started: true },
+                    "kiapi.common.commands.EditItemPropertiesResponse",
+                ))),
+                other => panic!("unexpected request {other}"),
+            }
+        })
+    }
+
+    fn sent<M: Message + Default>(requests: &Arc<Mutex<Vec<prost_types::Any>>>, suffix: &str) -> M {
+        let any = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|any| any.type_url.ends_with(suffix))
+            .cloned()
+            .unwrap_or_else(|| panic!("{suffix} was not sent"));
+        M::decode(any.value.as_slice()).expect("decodes")
+    }
+
+    #[tokio::test]
+    async fn a_deferred_action_names_its_editor_and_is_marked_deferred() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_run_editor_action(
+            &json!({ "editor": "pcb", "action": "pcbnew.EditorControl.boardSetup", "deferred": true }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", body(&result));
+        assert_eq!(body(&result)["deferred"], true);
+        let sent: kiapi::common::commands::RunAction = sent(&requests, "RunAction");
+        assert_eq!(sent.action, "pcbnew.EditorControl.boardSetup");
+        assert!(sent.deferred);
+        assert_eq!(
+            sent.frame,
+            kiapi::common::types::FrameType::FtPcbEditor as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn the_checker_runs_against_the_open_document() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_run_checker(
+            &json!({ "editor": "pcb" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", body(&result));
+        assert_eq!(body(&result)["checker"], "DRC");
+        assert_eq!(body(&result)["started"], true);
+        let sent: kiapi::common::commands::RunChecker = sent(&requests, "RunChecker");
+        assert_eq!(sent.document, Some(pcb_document()));
+    }
+
+    #[tokio::test]
+    async fn closing_a_dialog_reports_its_title() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_close_dialog(
+            &json!({ "button": "cancel" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body(&result),
+            json!({ "closed_with": "cancel", "dialog": "Board Setup" })
+        );
+        let sent: kiapi::common::commands::CloseDialog = sent(&requests, "CloseDialog");
+        assert_eq!(sent.button, "cancel");
+    }
+
+    #[tokio::test]
+    async fn a_footprint_is_edited_by_reference_through_its_kiid() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_edit_item_properties(
+            &json!({ "editor": "pcb", "reference": "R101", "fields": { "Datasheet": "https://example.com/r.pdf" } }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", body(&result));
+        assert_eq!(body(&result)["started"], true);
+        let sent: kiapi::common::commands::EditItemProperties =
+            sent(&requests, "EditItemProperties");
+        assert_eq!(sent.item.map(|id| id.value).as_deref(), Some("fp-r101"));
+        assert_eq!(sent.fields.len(), 1);
+        assert_eq!(sent.fields[0].name, "Datasheet");
+        assert_eq!(sent.fields[0].value, "https://example.com/r.pdf");
+    }
+
+    #[tokio::test]
+    async fn the_3d_view_is_saved_where_asked() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_capture_3d_view(
+            &json!({ "path": "/tmp/view.png" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body(&result),
+            json!({ "path": "/tmp/view.png", "width": 1280, "height": 720 })
+        );
+        let sent: kiapi::common::commands::Capture3DView = sent(&requests, "Capture3DView");
+        assert_eq!(sent.path, "/tmp/view.png");
+        let relative =
+            handle_capture_3d_view(&json!({ "path": "view.png" }), &context(String::new()))
+                .await
+                .unwrap();
+        assert_eq!(body(&relative)["error"]["kind"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn a_footprint_is_opened_after_its_editor() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_open_footprint_editor(
+            &json!({ "library": "Resistor_SMD", "name": "R_0603_1608Metric" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&result)["opened"], "Resistor_SMD:R_0603_1608Metric");
+        let order: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|any| any.type_url.rsplit('.').next().unwrap().to_string())
+            .collect();
+        assert_eq!(order, ["OpenEditor", "OpenFootprint"]);
+        let sent: kiapi::common::commands::OpenFootprint = sent(&requests, "OpenFootprint");
+        let id = sent.lib_id.unwrap();
+        assert_eq!(
+            (id.library_nickname.as_str(), id.entry_name.as_str()),
+            ("Resistor_SMD", "R_0603_1608Metric")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_can_target_the_3d_viewer() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_fork(requests.clone());
+        let result = handle_run_editor_action(
+            &json!({ "editor": "3d", "action": "3DViewer.Control.viewTop" }),
+            &context(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", body(&result));
+        let sent: kiapi::common::commands::RunAction = sent(&requests, "RunAction");
+        assert_eq!(
+            sent.frame,
+            kiapi::common::types::FrameType::Ft3dViewer as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_arguments_are_refused_before_any_request() {
+        let ctx = context(String::new());
+        let editor = handle_run_editor_action(&json!({ "editor": "gerber", "action": "x" }), &ctx)
+            .await
+            .unwrap();
+        let button = handle_close_dialog(&json!({ "button": "yes" }), &ctx)
+            .await
+            .unwrap();
+        let fields = handle_edit_item_properties(
+            &json!({ "editor": "pcb", "reference": "R1", "fields": {} }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let sheet = handle_edit_item_properties(
+            &json!({ "editor": "schematic", "reference": "R1", "fields": { "Value": "1k" } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        for result in [editor, button, fields, sheet] {
+            assert!(result.is_error);
+            assert_eq!(body(&result)["error"]["kind"], "invalid_argument");
+        }
     }
 }

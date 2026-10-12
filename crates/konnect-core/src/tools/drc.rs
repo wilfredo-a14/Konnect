@@ -317,6 +317,13 @@ mod tests {
         MockIpcServer::spawn("drc-sync", move |request| {
             let command = request.message.unwrap();
             let name = command.type_url.rsplit('/').next().unwrap().to_string();
+            // A stock KiCad: only the fredo fork shows tool calls in its activity panel
+            if name == "kiapi.common.commands.LogActivity" {
+                let mut unhandled = response(None, false);
+                unhandled.status.as_mut().unwrap().status =
+                    kiapi::common::ApiStatusCode::AsUnhandled as i32;
+                return unhandled;
+            }
             commands.lock().unwrap().push(name.clone());
             if *busy.lock().unwrap() && name == "kiapi.common.commands.GetOpenDocuments" {
                 if mode != "busy-forever" {

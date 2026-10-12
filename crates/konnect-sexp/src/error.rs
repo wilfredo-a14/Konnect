@@ -37,6 +37,13 @@ pub enum SexpError {
         inspection_error: Option<String>,
     },
 
+    /// A live KiCad editor reports unsaved changes to the design document.
+    ///
+    /// Writing would leave the editor's copy and the file diverged, and the
+    /// editor's next save would discard the write.
+    #[error("KiCad has unsaved changes to {path}")]
+    KiCadEditorUnsaved { path: PathBuf },
+
     /// A revision-aware command found that one of its target items no longer
     /// matches the exact item revision on which the command was prepared.
     #[error("item conflict in {path}: {item}: {reason}")]

@@ -4,6 +4,7 @@ pub mod command;
 pub mod error;
 pub mod geometry;
 pub mod layers;
+pub mod live_editor;
 pub mod net;
 pub mod parser;
 pub mod schematic;

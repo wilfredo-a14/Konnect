@@ -98,6 +98,14 @@ fn spawn_kicad(
             }
         };
         let ok = |message| reply(kiapi::common::ApiStatusCode::AsOk, "", Some(message));
+        // A stock KiCad: only the fredo fork shows tool calls in its activity panel
+        if command.type_url.ends_with("LogActivity") {
+            return reply(
+                kiapi::common::ApiStatusCode::AsUnhandled,
+                "no handler",
+                None,
+            );
+        }
         if command.type_url.ends_with("GetOpenDocuments") {
             return ok(konnect_ipc::builders::pack_any(
                 &kiapi::common::commands::GetOpenDocumentsResponse {

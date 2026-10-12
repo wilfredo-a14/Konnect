@@ -640,6 +640,9 @@ fn map_sexp_error(error: konnect_sexp::SexpError) -> crate::error::Error {
         konnect_sexp::SexpError::KiCadEditorLocked {
             path, lock_path, ..
         } => crate::error::Error::KiCadEditorLocked { path, lock_path },
+        konnect_sexp::SexpError::KiCadEditorUnsaved { path } => {
+            crate::error::Error::KiCadEditorUnsaved { path }
+        }
         error => crate::error::Error::Io(std::io::Error::other(error)),
     }
 }

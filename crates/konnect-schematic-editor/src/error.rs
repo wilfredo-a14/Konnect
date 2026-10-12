@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("KiCad editor lock blocks write to '{path}': {lock_path}")]
     KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
+
+    #[error("KiCad has unsaved changes to '{path}'")]
+    KiCadEditorUnsaved { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

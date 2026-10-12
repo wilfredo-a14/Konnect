@@ -282,47 +282,65 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    Ok(
-        match live_board::observe(ctx, board_path, move |client, _| f(client)).await? {
-            LiveBoard::Answered(value) => BoardWrite::Ipc(value),
-            LiveBoard::Recovered(message) => {
-                BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
-            }
-            LiveBoard::Uncertain(message) => {
-                BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
-            }
-            // An endpoint that served no board is mapped exactly as a
-            // rejection, which is what it was before those cases had names —
-            // `observed_live` and `absence` deliberately unread here. Whether
-            // a write should instead treat a proven-absent editor as
-            // permission is #577's question, not this one's.
-            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
-                BoardWrite::Refused(CallToolResult::error(format!(
-                    "KiCAD rejected the {what} over IPC: {message}. \
+    attempt_ipc_write_in(ctx, board_path, what, move |client, _| f(client)).await
+}
+
+/// As [`attempt_ipc_write`], for a write that names the bound board document
+/// in its own request (editor state such as the active layer).
+pub(crate) async fn attempt_ipc_write_in<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    what: &str,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+{
+    Ok(match live_board::observe(ctx, board_path, f).await? {
+        LiveBoard::Answered(value) => BoardWrite::Ipc(value),
+        LiveBoard::Recovered(message) => {
+            BoardWrite::Refused(crate::tools::ipc_recovered_result(&message))
+        }
+        LiveBoard::Uncertain(message) => {
+            BoardWrite::Refused(crate::tools::ipc_uncertain_result(&message))
+        }
+        // An endpoint that served no board is mapped exactly as a
+        // rejection, which is what it was before those cases had names —
+        // `observed_live` and `absence` deliberately unread here. Whether
+        // a write should instead treat a proven-absent editor as
+        // permission is #577's question, not this one's.
+        LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+            BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
                  The board file was not modified — KiCAD is reachable and may hold this \
                  board open, so editing the file directly could be silently overwritten."
-                )))
-            }
-            LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
-            LiveBoard::Unresolved(error) => {
-                BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
-            }
-            // A lock outranks the never-reached verdict: it is persistent evidence
-            // that an editor may hold newer state even where no IPC session ever did.
-            LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
-                Some(refusal) => BoardWrite::Refused(refusal),
-                None => BoardWrite::File(NoLiveBoard::Unreachable),
-            },
-            // A lock outranks this verdict too, but only when the transport is
-            // what went away: it is then the more specific evidence, and
-            // `reason` is machine-readable, so which one a client sees must not
-            // depend on how the arms were folded.
-            LiveBoard::LostAfterObservation {
-                situation,
-                ipc_unreachable,
-            } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+            )))
+        }
+        LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
+        LiveBoard::Unresolved(error) => {
+            BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
+        }
+        // A lock outranks the never-reached verdict: it is persistent evidence
+        // that an editor may hold newer state even where no IPC session ever did.
+        LiveBoard::NeverReached(_) => match board_lock_refusal(board_path) {
+            Some(refusal) => BoardWrite::Refused(refusal),
+            None => BoardWrite::File(NoLiveBoard::Unreachable),
         },
-    )
+        // A lock outranks this verdict too, but only when the transport is
+        // what went away: it is then the more specific evidence, and
+        // `reason` is machine-readable, so which one a client sees must not
+        // depend on how the arms were folded.
+        LiveBoard::LostAfterObservation {
+            situation,
+            ipc_unreachable,
+        } => BoardWrite::Refused(lost_board_refusal(board_path, situation, ipc_unreachable)),
+    })
 }
 
 /// A board observed live and now out of reach. When the transport is what
@@ -989,19 +1007,35 @@ fn format_zone_polygon(
     )
 }
 
-/// A standalone filled polygon graphic (`gr_poly`), not tied to a net or zone
-/// fill — used for imported artwork rather than copper pours.
+/// A standalone polygon graphic (`gr_poly`), not tied to a net or zone fill —
+/// used for imported artwork rather than copper pours. Filled, except on
+/// Edge.Cuts: see [`is_outline_layer`].
 fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
     let uuid = new_uuid();
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
+    let (width, fill) = if is_outline_layer(layer) {
+        (OUTLINE_STROKE_MM, "no")
+    } else {
+        (0.0, "solid")
+    };
     format!(
         "\n  (gr_poly\n    (pts{pts}\n    )\n    \
-         (stroke (width 0) (type solid))\n    (fill solid)\n    \
+         (stroke (width {width}) (type solid))\n    (fill {fill})\n    \
          (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
     )
+}
+
+/// Stroke width of an imported board outline, as KiCad draws its own.
+const OUTLINE_STROKE_MM: f64 = 0.05;
+
+/// Edge.Cuts shapes are a board outline, not artwork. KiCad treats a filled
+/// shape there as a solid region, so every pad inside it fails copper-to-edge
+/// clearance; an imported outline must stay unfilled.
+fn is_outline_layer(layer: &str) -> bool {
+    layer.eq_ignore_ascii_case("Edge.Cuts")
 }
 
 /// Byte offset of the `)` that closes the block opening at `open_pos`.
@@ -1148,7 +1182,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
-            "Request an editor active-layer change. The bundled stable KiCad IPC protocol does not expose this editor-session operation, so this tool currently returns unsupported_capability without modifying the board file. It never writes an (active_layer ...) token because KiCad 10 board files do not support one.",
+            "Make a layer the PCB editor's active layer, as clicking it in the Appearance panel does, on a board open in KiCad. Reads the active layer back and reports it with the previous one. Editor state only: it never writes the board file (KiCad 10 board files have no active layer), and refuses when the board is not open in KiCad.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1158,6 +1192,20 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
+        ),
+        tool!(
+            "set_layer_visibility",
+            "Show or hide layers in the PCB editor, as the eye toggles in the Appearance panel do, on a board open in KiCad. Reads the visible layers back and reports what changed. Editor state only: it never writes the board file, and refuses when the board is not open in KiCad.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "show":  { "type": "array", "items": { "type": "string" }, "description": "Layer names to show, e.g. ['F.Fab']" },
+                    "hide":  { "type": "array", "items": { "type": "string" }, "description": "Layer names to hide, e.g. ['B.Silkscreen']" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_set_layer_visibility(args, ctx).await }
         ),
         tool!(
             "add_board_outline",
@@ -2003,49 +2051,228 @@ async fn handle_add_layer(
     })))
 }
 
-async fn handle_set_active_layer(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
+/// A layer name as KiCad's board API knows it, or the tool's invalid-argument result.
+fn board_layer(
+    field: &str,
+    name: &str,
+) -> Result<konnect_ipc::gen::kiapi::board::types::BoardLayer, CallToolResult> {
+    konnect_ipc::builders::try_layer_from_name(name).map_err(|_| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: format!("'{name}' is not a KiCad board layer name"),
+            },
+            format!(
+                "'{name}' is not a KiCad board layer name (for example F.Cu, B.Silkscreen, In1.Cu)"
+            ),
+        )
+    })
+}
 
-    Ok(CallToolResult::error_kind(
+fn layer_label(layer: konnect_ipc::gen::kiapi::board::types::BoardLayer) -> String {
+    konnect_ipc::builders::layer_name(layer)
+        .map(str::to_string)
+        .unwrap_or_else(|| layer.as_str_name().to_string())
+}
+
+/// Active layer and visibility live in the editor, so a board KiCad does not
+/// hold open has nothing to change.
+fn editor_state_needs_open_board(
+    tool: &str,
+    what: &str,
+    board_path: &std::path::Path,
+) -> CallToolResult {
+    CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::UnsupportedCapability {
-            capability: "set_active_layer".to_string(),
+            capability: tool.to_string(),
             kicad_version: None,
         },
         format!(
-            "Cannot set active layer '{layer}' for '{}': active layer is editor-session state, and the bundled stable KiCad IPC protocol does not expose a supported mutation or readback. The board file was not changed.",
+            "Cannot change the {what} for '{}': it is PCB editor state, and KiCad does not hold this board open. Open the board in KiCad first. The board file was not changed.",
             board_path.display()
         ),
-    ))
+    )
+}
+
+async fn handle_set_active_layer(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let name = match require_str(args, "layer") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let layer = match board_layer("layer", &name) {
+        Ok(layer) => layer,
+        Err(result) => return Ok(result),
+    };
+
+    let outcome = attempt_ipc_write_in(
+        ctx,
+        &board_path,
+        "active layer change",
+        move |client, document| {
+            let before = client.get_active_layer_in(document.clone())?;
+            client.set_active_layer_in(document.clone(), layer)?;
+            let after = client.get_active_layer_in(document)?;
+            Ok((before, after))
+        },
+    )
+    .await?;
+
+    match outcome {
+        BoardWrite::Ipc((before, after)) if after == layer => Ok(CallToolResult::json(&json!({
+            "active_layer": layer_label(after),
+            "previous": layer_label(before),
+            "source": "ipc"
+        }))),
+        BoardWrite::Ipc((_, after)) => Ok(CallToolResult::error(format!(
+            "KiCad accepted the change but its active layer reads back as {}, not {name}. The board file was not changed.",
+            layer_label(after)
+        ))),
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(_) => Ok(editor_state_needs_open_board(
+            "set_active_layer",
+            "active layer",
+            &board_path,
+        )),
+    }
+}
+
+async fn handle_set_layer_visibility(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let names = |field: &str| -> Vec<String> {
+        args.get(field)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (show_names, hide_names) = (names("show"), names("hide"));
+
+    if show_names.is_empty() && hide_names.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "show".to_string(),
+                reason: "name at least one layer in 'show' or 'hide'".to_string(),
+            },
+            "Name at least one layer to show or hide.",
+        ));
+    }
+    if let Some(both) = show_names.iter().find(|name| hide_names.contains(name)) {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "hide".to_string(),
+                reason: format!("'{both}' is in both 'show' and 'hide'"),
+            },
+            format!("'{both}' cannot be both shown and hidden."),
+        ));
+    }
+
+    let mut show = Vec::new();
+    let mut hide = Vec::new();
+    for (field, names, layers) in [
+        ("show", &show_names, &mut show),
+        ("hide", &hide_names, &mut hide),
+    ] {
+        for name in names {
+            match board_layer(field, name) {
+                Ok(layer) => layers.push(layer),
+                Err(result) => return Ok(result),
+            }
+        }
+    }
+
+    let (show_ipc, hide_ipc) = (show.clone(), hide.clone());
+    let outcome = attempt_ipc_write_in(
+        ctx,
+        &board_path,
+        "layer visibility change",
+        move |client, document| {
+            let before = client.get_visible_layers_in(document.clone())?;
+            let mut wanted: Vec<_> = before
+                .iter()
+                .copied()
+                .filter(|layer| !hide_ipc.contains(layer))
+                .collect();
+            for layer in &show_ipc {
+                if !wanted.contains(layer) {
+                    wanted.push(*layer);
+                }
+            }
+            client.set_visible_layers_in(document.clone(), &wanted)?;
+            let after = client.get_visible_layers_in(document)?;
+            Ok((before, after))
+        },
+    )
+    .await?;
+
+    match outcome {
+        BoardWrite::Ipc((before, after)) => {
+            // KiCad drops layers the board does not enable, so say which did not take
+            let not_shown: Vec<String> = show
+                .iter()
+                .filter(|l| !after.contains(l))
+                .map(|l| layer_label(*l))
+                .collect();
+            let not_hidden: Vec<String> = hide
+                .iter()
+                .filter(|l| after.contains(l))
+                .map(|l| layer_label(*l))
+                .collect();
+            let shown: Vec<String> = after
+                .iter()
+                .filter(|l| !before.contains(l))
+                .map(|l| layer_label(*l))
+                .collect();
+            let hidden: Vec<String> = before
+                .iter()
+                .filter(|l| !after.contains(l))
+                .map(|l| layer_label(*l))
+                .collect();
+            let body = json!({
+                "shown": shown,
+                "hidden": hidden,
+                "visible_layers": after.iter().map(|l| layer_label(*l)).collect::<Vec<_>>(),
+                "source": "ipc"
+            });
+            if not_shown.is_empty() && not_hidden.is_empty() {
+                Ok(CallToolResult::json(&body))
+            } else {
+                Ok(CallToolResult::error(format!(
+                    "KiCad did not apply all of the visibility change: not shown {not_shown:?} (a layer the board does not enable cannot be shown), still visible {not_hidden:?}. Visible now: {}",
+                    body["visible_layers"]
+                )))
+            }
+        }
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File(_) => Ok(editor_state_needs_open_board(
+            "set_layer_visibility",
+            "layer visibility",
+            &board_path,
+        )),
+    }
 }
 
 #[cfg(test)]
-mod active_layer_refusal_tests {
+mod editor_layer_tests {
+    use super::board_mock::{
+        board_document, ctx_talking_to, spawn_kicad_holding_board, spawn_kicad_reporting_documents,
+    };
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::{BoardAccess, ServerConfig};
-    use std::sync::Arc;
-
-    fn test_ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
-    }
+    use crate::tools::BoardAccess;
+    use konnect_ipc::gen::kiapi;
+    use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
 
     fn body(result: &CallToolResult) -> serde_json::Value {
         let text = match result.content.first() {
@@ -2055,39 +2282,230 @@ mod active_layer_refusal_tests {
         serde_json::from_str(text).expect("structured tool result")
     }
 
-    #[tokio::test]
-    async fn set_active_layer_is_typed_unsupported_and_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let board = dir.path().join("safe.kicad_pcb");
-        let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
+    fn board_file(dir: &tempfile::TempDir) -> (std::path::PathBuf, &'static [u8]) {
+        let board = dir.path().join("live.kicad_pcb");
+        let original: &[u8] = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n)\n";
         std::fs::write(&board, original).unwrap();
+        (board, original)
+    }
+
+    /// A KiCad holding `board` whose editor keeps an active layer and a visible set
+    fn spawn_editor(
+        board: &std::path::Path,
+        active: Arc<Mutex<BoardLayer>>,
+        visible: Arc<Mutex<Vec<BoardLayer>>>,
+    ) -> crate::test_support::MockIpcServer {
+        spawn_kicad_holding_board(board, move |command| {
+            let pack = |message: &dyn Fn() -> prost_types::Any| Some(message());
+            if command.type_url.ends_with("GetActiveLayer") {
+                let layer = *active.lock().unwrap() as i32;
+                pack(&|| {
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardLayerResponse { layer },
+                        "kiapi.board.commands.BoardLayerResponse",
+                    )
+                })
+            } else if command.type_url.ends_with("SetActiveLayer") {
+                let set = kiapi::board::commands::SetActiveLayer::decode(command.value.as_slice())
+                    .unwrap();
+                *active.lock().unwrap() = BoardLayer::try_from(set.layer).unwrap();
+                None
+            } else if command.type_url.ends_with("GetVisibleLayers") {
+                let layers: Vec<i32> = visible.lock().unwrap().iter().map(|l| *l as i32).collect();
+                pack(&|| {
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardLayers {
+                            layers: layers.clone(),
+                        },
+                        "kiapi.board.commands.BoardLayers",
+                    )
+                })
+            } else if command.type_url.ends_with("SetVisibleLayers") {
+                let set =
+                    kiapi::board::commands::SetVisibleLayers::decode(command.value.as_slice())
+                        .unwrap();
+                *visible.lock().unwrap() = set
+                    .layers
+                    .into_iter()
+                    // a board that enables no B.Fab drops it, as KiCad does
+                    .filter(|l| *l != BoardLayer::BlBFab as i32)
+                    .map(|l| BoardLayer::try_from(l).unwrap())
+                    .collect();
+                None
+            } else {
+                None
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_changes_the_editor_and_reports_the_previous_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let active = Arc::new(Mutex::new(BoardLayer::BlFCu));
+        let server = spawn_editor(&board, active.clone(), Arc::new(Mutex::new(Vec::new())));
+        let ctx = ctx_talking_to(server.address().to_string());
 
         let result = handle_set_active_layer(
             &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
-            &test_ctx(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", body(&result));
+        assert_eq!(
+            body(&result),
+            json!({"active_layer": "B.Cu", "previous": "F.Cu", "source": "ipc"})
+        );
+        assert_eq!(*active.lock().unwrap(), BoardLayer::BlBCu);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_refuses_a_name_that_is_not_a_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, _) = board_file(&dir);
+        let server = spawn_editor(
+            &board,
+            Arc::new(Mutex::new(BoardLayer::BlFCu)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "F.Copper"}),
+            &ctx,
         )
         .await
         .unwrap();
 
         assert!(result.is_error);
-        let body = body(&result);
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
-        assert!(body["message"].as_str().unwrap().contains("not changed"));
+        assert_eq!(body(&result)["error"]["kind"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn editor_layer_tools_refuse_a_board_kicad_does_not_hold_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let server = spawn_kicad_reporting_documents(
+            vec![board_document(&elsewhere.to_string_lossy())],
+            |_| None,
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let active = handle_set_active_layer(
+            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let visibility = handle_set_layer_visibility(
+            &json!({"board": board.to_str().unwrap(), "hide": ["F.Fab"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        for result in [active, visibility] {
+            assert!(result.is_error);
+            assert_eq!(body(&result)["error"]["kind"], "unsupported_capability");
+            assert!(body(&result)["message"]
+                .as_str()
+                .unwrap()
+                .contains("not changed"));
+        }
         assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 
-    #[test]
-    fn set_active_layer_catalogue_discloses_refusal_and_no_file_write_contract() {
-        let tool = tools()
-            .into_iter()
-            .find(|tool| tool.name == "set_active_layer")
-            .expect("registered tool");
+    #[tokio::test]
+    async fn set_layer_visibility_shows_and_hides_and_reports_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, original) = board_file(&dir);
+        let visible = Arc::new(Mutex::new(vec![
+            BoardLayer::BlFCu,
+            BoardLayer::BlFSilkS,
+            BoardLayer::BlBCu,
+        ]));
+        let server = spawn_editor(
+            &board,
+            Arc::new(Mutex::new(BoardLayer::BlFCu)),
+            visible.clone(),
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
 
-        assert_eq!(tool.board_access, BoardAccess::None);
-        assert!(tool.description.contains("unsupported_capability"));
-        assert!(tool.description.contains("never writes"));
-        assert!(!tool.description.contains("recorded in the board file"));
+        let result = handle_set_layer_visibility(
+            &json!({"board": board.to_str().unwrap(), "show": ["F.Fab"], "hide": ["F.Silkscreen"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", body(&result));
+        let body = body(&result);
+        assert_eq!(body["shown"], json!(["F.Fab"]));
+        // reported by the board file's layer names, whichever name was asked for
+        assert_eq!(body["hidden"], json!(["F.SilkS"]));
+        assert_eq!(body["visible_layers"], json!(["F.Cu", "B.Cu", "F.Fab"]));
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_layer_visibility_says_when_kicad_drops_a_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (board, _) = board_file(&dir);
+        let server = spawn_editor(
+            &board,
+            Arc::new(Mutex::new(BoardLayer::BlFCu)),
+            Arc::new(Mutex::new(vec![BoardLayer::BlFCu])),
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_set_layer_visibility(
+            &json!({"board": board.to_str().unwrap(), "show": ["B.Fab"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let message = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(message.contains("not shown [\"B.Fab\"]"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn set_layer_visibility_needs_a_layer_and_refuses_one_in_both_lists() {
+        let ctx = ctx_talking_to(String::new());
+        let none = handle_set_layer_visibility(&json!({"board": "/b.kicad_pcb"}), &ctx)
+            .await
+            .unwrap();
+        let both = handle_set_layer_visibility(
+            &json!({"board": "/b.kicad_pcb", "show": ["F.Fab"], "hide": ["F.Fab"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&none)["error"]["kind"], "invalid_argument");
+        assert_eq!(body(&both)["error"]["kind"], "invalid_argument");
+    }
+
+    #[test]
+    fn editor_layer_tools_say_they_never_write_the_board_file() {
+        for name in ["set_active_layer", "set_layer_visibility"] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .expect("registered tool");
+            assert_eq!(tool.board_access, BoardAccess::None, "{name}");
+            assert!(
+                tool.description.contains("never writes the board file"),
+                "{name}"
+            );
+        }
     }
 }
 
@@ -2672,7 +3090,11 @@ async fn handle_import_svg_logo(
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
     let ipc_attempt = attempt_ipc_write(ctx, &board_path, "SVG logo", move |c| {
-        let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc);
+        let shape = if is_outline_layer(&layer_ipc) {
+            builders::board_polygon(&layer_ipc, OUTLINE_STROKE_MM, false, &placed_ipc)
+        } else {
+            builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc)
+        };
         let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
         c.create_items(vec![any]).map(|_| ())
     })
@@ -3955,6 +4377,14 @@ mod svg_logo_tests {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
             <path d="M0 0 L100 0 L100 100 L0 100 Z" fill="black"/>
         </svg>"##
+    }
+
+    #[test]
+    fn format_gr_poly_leaves_an_edge_cuts_outline_unfilled() {
+        let sexp = format_gr_poly(&[(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)], "Edge.Cuts");
+        assert!(sexp.contains("(fill no)"));
+        assert!(sexp.contains("(stroke (width 0.05)"));
+        assert!(!sexp.contains("(fill solid)"));
     }
 
     #[test]

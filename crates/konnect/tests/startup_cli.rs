@@ -16,6 +16,8 @@ fn konnect(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
     command.env("HOME", home);
     command.env("XDG_CONFIG_HOME", home.join(".config"));
+    // Never the developer's running KiCad (see protocol_stdio.rs)
+    command.env("KICAD_API_SOCKET", "ipc:///tmp/konnect-tests-no-kicad.sock");
     command
 }
 

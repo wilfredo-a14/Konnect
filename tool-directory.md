@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **237 registered tools** + **7 always-visible meta-tools** = **244 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -70,12 +70,20 @@ and Windows servers do not.
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
-### `editor_navigation` · 5 tools
+### `editor_navigation` · 13 tools
 **Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.
 **Source:** [`crates/konnect-core/src/tools/editor_navigation.rs`](crates/konnect-core/src/tools/editor_navigation.rs)
 
 | Tool | Description |
 |------|-------------|
+| `open_editor` | Open a KiCad editor window, or bring it to the front, as the project manager's launcher buttons do (schematic, PCB, symbol, footprint, or the project manager), from whichever KiCad window is in front. Needs the fredo KiCad fork; refuses instead of prompting when no project is open or the project has no such file. |
+| `run_editor_action` | Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does; `deferred` for actions that open a modal dialog (setup and preferences), which close_dialog then dismisses. The agent cursor points at the button. Fredo fork for deferred and schematic actions. |
+| `run_checker` | Run DRC (PCB editor) or ERC (schematic editor) as a person would: open the checker dialog, click Run, leave the results on screen; the API Activity log reports the counts. Fredo fork; the editor must be open. |
+| `close_dialog` | Click OK or Cancel on the frontmost KiCad dialog with the agent cursor on the button; reports the dialog's title. Fredo fork. |
+| `capture_3d_view` | Save what the 3D viewer shows as a PNG at an absolute path, so the rendered board can be inspected without a screenshot; open it with open_editor('3d') and set the view with run_editor_action('3d', …). Fredo fork. |
+| `open_footprint_editor` | Load a library footprint into the footprint editor, as its library tree does; its pads, graphics and fields are then reachable through the board item API. Refused while the editor holds unsaved changes. Fredo fork. |
+| `save_footprint` | Save the footprint the footprint editor holds back to its library. Fredo fork. |
+| `edit_item_properties` | Edit a footprint or symbol through its Properties dialog as a person would: select it, open the dialog, type each field's new value into the field grid with the agent cursor on the cell, click OK. A field the dialog does not list cancels the dialog. Fredo fork; the editor must be open. |
 | `get_editor_state` | Observe the configured KiCad IPC endpoint's running version, addressable schematic/PCB editors, exact open document identities, capability availability, and explicit active-context limitations. |
 | `get_editor_selection` | Read the selection from one exact editor, project, document, and hierarchical sheet instance with stable KIID/UUID identities and document-readback freshness checks. |
 | `resolve_navigation_target` | Resolve an exact open project/document/sheet object by stable KIID, or by a human reference only when saved KiCad structure yields one unambiguous candidate. |
@@ -232,7 +240,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 13 tools
+### `pcb_board` · 14 tools
 **Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -244,7 +252,8 @@ and Windows servers do not.
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
 | `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
-| `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
+| `set_active_layer` | Make a layer the PCB editor's active layer, as clicking it in the Appearance panel does, on a board open in KiCad; reads it back and reports the previous one. Editor state only: never writes the board file, and refuses when the board is not open in KiCad. |
+| `set_layer_visibility` | Show or hide layers in the PCB editor, as the Appearance panel's eye toggles do, on a board open in KiCad; reads the visible layers back and reports what changed. Editor state only: never writes the board file, and refuses when the board is not open in KiCad. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |

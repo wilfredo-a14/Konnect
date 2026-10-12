@@ -1053,6 +1053,14 @@ impl KiCadIpcClient {
         client
     }
 
+    /// Name this client in KiCad's request headers. A process that lives for
+    /// one request, such as a hook, uses a fixed name so that KiCad can pair
+    /// requests sent from separate processes.
+    pub fn with_client_name(mut self, name: impl Into<String>) -> Self {
+        self.client_name = name.into();
+        self
+    }
+
     /// Send a protobuf command and return the response Any.
     fn send_command(
         &self,
@@ -1474,6 +1482,127 @@ impl KiCadIpcClient {
             "GetOpenDocuments",
         )?;
         Ok(response.documents)
+    }
+
+    /// As [`Self::get_open_documents_for`], waiting at most `recv_timeout`.
+    pub fn get_open_documents_within(
+        &self,
+        editor: IpcEditorKind,
+        recv_timeout: std::time::Duration,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        let document_type = match editor {
+            IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
+            IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
+        };
+        let command = kiapi::common::commands::GetOpenDocuments {
+            r#type: document_type as i32,
+        };
+        let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
+            self.send_command_within(
+                &command,
+                "kiapi.common.commands.GetOpenDocuments",
+                recv_timeout,
+            )?,
+            "GetOpenDocuments",
+        )?;
+        Ok(response.documents)
+    }
+
+    /// Whether an open document holds unsaved changes. KiCad 10.0 releases
+    /// lack `GetDocumentModifiedState` and answer with an error; the fredo
+    /// fork and KiCad 11 implement it.
+    pub fn get_document_modified_state(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        recv_timeout: std::time::Duration,
+    ) -> Result<kiapi::common::commands::DocumentModifiedState> {
+        let command = kiapi::common::commands::GetDocumentModifiedState {
+            document: Some(document.clone()),
+        };
+        let response = unpack_required::<kiapi::common::commands::GetDocumentModifiedStateResponse>(
+            self.send_command_within(
+                &command,
+                "kiapi.common.commands.GetDocumentModifiedState",
+                recv_timeout,
+            )?,
+            "GetDocumentModifiedState",
+        )?;
+        Ok(
+            kiapi::common::commands::DocumentModifiedState::try_from(response.state)
+                .unwrap_or(kiapi::common::commands::DocumentModifiedState::DmsUnknown),
+        )
+    }
+
+    /// Brighten `items` in the editor and bring them into view, replacing the
+    /// previous highlight; returns how many KiCad found. Only the fredo fork
+    /// implements `HighlightItems`.
+    ///
+    /// `label` says what was done, beside the fork's agent cursor; `moved`
+    /// lists items that moved with their previous position in the
+    /// document's API units, which the cursor shows being dragged.
+    pub fn highlight_items(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+        items: &[String],
+        label: &str,
+        moved: &[(String, (i64, i64))],
+    ) -> Result<i32> {
+        let command = kiapi::common::commands::HighlightItems {
+            document: Some(document.clone()),
+            items: items
+                .iter()
+                .map(|value| kiapi::common::types::Kiid {
+                    value: value.clone(),
+                })
+                .collect(),
+            label: label.to_string(),
+            moved: moved
+                .iter()
+                .map(|(id, (x, y))| kiapi::common::commands::MovedItem {
+                    item: Some(kiapi::common::types::Kiid { value: id.clone() }),
+                    from: Some(kiapi::common::types::Vector2 { x_nm: *x, y_nm: *y }),
+                })
+                .collect(),
+        };
+        let response = unpack_required::<kiapi::common::commands::HighlightItemsResponse>(
+            self.send_command(&command, "kiapi.common.commands.HighlightItems")?,
+            "HighlightItems",
+        )?;
+        Ok(response.highlighted)
+    }
+
+    /// Open an editor window, or bring it to the front, through the project
+    /// manager. Only the fredo fork implements `OpenEditor`.
+    pub fn open_editor(&self, frame: kiapi::common::types::FrameType) -> Result<()> {
+        let command = kiapi::common::commands::OpenEditor {
+            frame: frame as i32,
+        };
+        self.send_command(&command, "kiapi.common.commands.OpenEditor")?;
+        Ok(())
+    }
+
+    /// Describe an operation to the API Activity panel. Only the fredo fork
+    /// implements `LogActivity`; waits at most `recv_timeout` for the reply.
+    pub fn log_activity(
+        &self,
+        activity: &kiapi::common::commands::LogActivity,
+        recv_timeout: std::time::Duration,
+    ) -> Result<()> {
+        self.send_command_within(activity, "kiapi.common.commands.LogActivity", recv_timeout)?;
+        Ok(())
+    }
+
+    /// Ask the editor to reload `document` from disk. The fredo fork refuses
+    /// while the schematic holds unsaved changes instead of discarding them.
+    pub fn revert_document(
+        &self,
+        document: &kiapi::common::types::DocumentSpecifier,
+    ) -> Result<()> {
+        let command = kiapi::common::commands::RevertDocument {
+            document: Some(document.clone()),
+        };
+        self.send_command(&command, "kiapi.common.commands.RevertDocument")?;
+        Ok(())
     }
 
     /// Observe the editor/document surface exposed by the configured endpoint.
@@ -4655,9 +4784,297 @@ impl KiCadIpcClient {
     pub fn run_action(&self, action: &str) -> Result<()> {
         let cmd = kiapi::common::commands::RunAction {
             action: action.to_string(),
+            ..Default::default()
         };
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
+    }
+
+    /// The PCB editor's active layer for `document`.
+    pub fn get_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<kiapi::board::types::BoardLayer> {
+        let response = unpack_required::<kiapi::board::commands::BoardLayerResponse>(
+            self.send_command(
+                &kiapi::board::commands::GetActiveLayer {
+                    board: Some(document),
+                },
+                "kiapi.board.commands.GetActiveLayer",
+            )?,
+            "GetActiveLayer",
+        )?;
+        Ok(kiapi::board::types::BoardLayer::try_from(response.layer)
+            .unwrap_or(kiapi::board::types::BoardLayer::BlUndefined))
+    }
+
+    /// Make `layer` the PCB editor's active layer for `document`.
+    pub fn set_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: kiapi::board::types::BoardLayer,
+    ) -> Result<()> {
+        self.send_command(
+            &kiapi::board::commands::SetActiveLayer {
+                board: Some(document),
+                layer: layer as i32,
+            },
+            "kiapi.board.commands.SetActiveLayer",
+        )?;
+        Ok(())
+    }
+
+    /// The layers the PCB editor shows for `document`.
+    pub fn get_visible_layers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<kiapi::board::types::BoardLayer>> {
+        let response = unpack_required::<kiapi::board::commands::BoardLayers>(
+            self.send_command(
+                &kiapi::board::commands::GetVisibleLayers {
+                    board: Some(document),
+                },
+                "kiapi.board.commands.GetVisibleLayers",
+            )?,
+            "GetVisibleLayers",
+        )?;
+        Ok(response
+            .layers
+            .into_iter()
+            .filter_map(|layer| kiapi::board::types::BoardLayer::try_from(layer).ok())
+            .collect())
+    }
+
+    /// Show exactly `layers` in the PCB editor for `document`; KiCad drops
+    /// layers the board does not enable.
+    pub fn set_visible_layers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layers: &[kiapi::board::types::BoardLayer],
+    ) -> Result<()> {
+        self.send_command(
+            &kiapi::board::commands::SetVisibleLayers {
+                board: Some(document),
+                layers: layers.iter().map(|layer| *layer as i32).collect(),
+            },
+            "kiapi.board.commands.SetVisibleLayers",
+        )?;
+        Ok(())
+    }
+
+    /// The PCB editor's appearance settings: inactive-layer display, net
+    /// colors, board flip and ratsnest mode.
+    pub fn get_board_editor_appearance(
+        &self,
+    ) -> Result<kiapi::board::commands::BoardEditorAppearanceSettings> {
+        unpack_required::<kiapi::board::commands::BoardEditorAppearanceSettings>(
+            self.send_command(
+                &kiapi::board::commands::GetBoardEditorAppearanceSettings {},
+                "kiapi.board.commands.GetBoardEditorAppearanceSettings",
+            )?,
+            "GetBoardEditorAppearanceSettings",
+        )
+    }
+
+    /// Replace the PCB editor's appearance settings; read them first and
+    /// change only what should change, as every field is applied.
+    pub fn set_board_editor_appearance(
+        &self,
+        settings: kiapi::board::commands::BoardEditorAppearanceSettings,
+    ) -> Result<()> {
+        self.send_command(
+            &kiapi::board::commands::SetBoardEditorAppearanceSettings {
+                settings: Some(settings),
+            },
+            "kiapi.board.commands.SetBoardEditorAppearanceSettings",
+        )?;
+        Ok(())
+    }
+
+    /// Run an editor action by name in `frame`'s editor. With `deferred`, KiCad
+    /// replies first and runs it after, for actions that open a modal dialog
+    /// (fredo fork). Returns whether the editor knew the action.
+    pub fn run_action_in(
+        &self,
+        frame: kiapi::common::types::FrameType,
+        action: &str,
+        deferred: bool,
+    ) -> Result<bool> {
+        let response = unpack_required::<kiapi::common::commands::RunActionResponse>(
+            self.send_command(
+                &kiapi::common::commands::RunAction {
+                    action: action.to_string(),
+                    deferred,
+                    frame: frame as i32,
+                },
+                "kiapi.common.commands.RunAction",
+            )?,
+            "RunAction",
+        )?;
+        Ok(response.status == kiapi::common::commands::RunActionStatus::RasOk as i32)
+    }
+
+    /// Open the DRC (board) or ERC (schematic) dialog of the editor holding
+    /// `document` and click Run, as a person would (fredo fork). Returns once
+    /// the run has started; the counts reach the API Activity log.
+    pub fn run_checker(&self, document: kiapi::common::types::DocumentSpecifier) -> Result<bool> {
+        let response = unpack_required::<kiapi::common::commands::RunCheckerResponse>(
+            self.send_command(
+                &kiapi::common::commands::RunChecker {
+                    document: Some(document),
+                },
+                "kiapi.common.commands.RunChecker",
+            )?,
+            "RunChecker",
+        )?;
+        Ok(response.started)
+    }
+
+    /// Click OK or Cancel (`button`) on the frontmost dialog (fredo fork).
+    /// Returns whether a dialog was found, with its title.
+    pub fn close_dialog(&self, button: &str) -> Result<(bool, String)> {
+        let response = unpack_required::<kiapi::common::commands::CloseDialogResponse>(
+            self.send_command(
+                &kiapi::common::commands::CloseDialog {
+                    button: button.to_string(),
+                },
+                "kiapi.common.commands.CloseDialog",
+            )?,
+            "CloseDialog",
+        )?;
+        Ok((response.found, response.title))
+    }
+
+    /// Open the Properties dialog of the item `kiid` in `document`, type
+    /// `fields` (name, value) into its field grid and click OK, as a person
+    /// would (fredo fork). Returns once the dialog is opening.
+    pub fn edit_item_properties(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        kiid: &str,
+        fields: &[(String, String)],
+    ) -> Result<bool> {
+        let response = unpack_required::<kiapi::common::commands::EditItemPropertiesResponse>(
+            self.send_command(
+                &kiapi::common::commands::EditItemProperties {
+                    document: Some(document),
+                    item: Some(kiapi::common::types::Kiid {
+                        value: kiid.to_string(),
+                    }),
+                    fields: fields
+                        .iter()
+                        .map(|(name, value)| kiapi::common::commands::FieldEdit {
+                            name: name.clone(),
+                            value: value.clone(),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.EditItemProperties",
+            )?,
+            "EditItemProperties",
+        )?;
+        Ok(response.started)
+    }
+
+    /// The KIID of the footprint with `reference` on the live board, if any.
+    pub fn footprint_kiid(&self, reference: &str) -> Result<Option<String>> {
+        for item in self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)? {
+            let Ok(fp) = <kiapi::board::types::FootprintInstance as prost::Message>::decode(
+                item.value.as_slice(),
+            ) else {
+                continue;
+            };
+            let text = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            if text == reference {
+                return Ok(fp.id.map(|id| id.value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Save what the 3D viewer shows as a PNG at `path` (fredo fork). Returns
+    /// the image size. Fails when the 3D viewer is not open on screen.
+    pub fn capture_3d_view(&self, path: &str) -> Result<(i32, i32)> {
+        let response = unpack_required::<kiapi::common::commands::Capture3DViewResponse>(
+            self.send_command(
+                &kiapi::common::commands::Capture3DView {
+                    path: path.to_string(),
+                },
+                "kiapi.common.commands.Capture3DView",
+            )?,
+            "Capture3DView",
+        )?;
+        Ok((response.width, response.height))
+    }
+
+    /// Load the footprint `library`:`name` into the footprint editor, as its
+    /// library tree does (fredo fork). Refused while the editor holds unsaved
+    /// changes.
+    pub fn open_footprint(&self, library: &str, name: &str) -> Result<()> {
+        self.send_command(
+            &kiapi::common::commands::OpenFootprint {
+                lib_id: Some(kiapi::common::types::LibraryIdentifier {
+                    library_nickname: library.to_string(),
+                    entry_name: name.to_string(),
+                }),
+            },
+            "kiapi.common.commands.OpenFootprint",
+        )?;
+        Ok(())
+    }
+
+    /// The footprint the footprint editor holds, as a document (fredo fork):
+    /// its pads, graphics and fields are reachable with [`Self::get_items_in`].
+    pub fn footprint_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
+        let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
+            self.send_command(
+                &kiapi::common::commands::GetOpenDocuments {
+                    r#type: kiapi::common::types::DocumentType::DoctypeFootprint as i32,
+                },
+                "kiapi.common.commands.GetOpenDocuments",
+            )?,
+            "GetOpenDocuments",
+        )?;
+        response
+            .documents
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the footprint editor holds no footprint"))
+    }
+
+    /// Save the footprint the footprint editor holds back to its library
+    /// (fredo fork).
+    pub fn save_footprint(&self) -> Result<()> {
+        let document = self.footprint_document()?;
+        self.send_command(
+            &kiapi::common::commands::SaveDocument {
+                document: Some(document),
+            },
+            "kiapi.common.commands.SaveDocument",
+        )?;
+        Ok(())
+    }
+
+    /// The newest `count` entries (0: all kept) of the fredo fork's API
+    /// Activity log, oldest first.
+    pub fn get_api_activity(
+        &self,
+        count: u32,
+    ) -> Result<Vec<kiapi::common::commands::ApiActivityEntry>> {
+        let response = unpack_required::<kiapi::common::commands::GetApiActivityResponse>(
+            self.send_command(
+                &kiapi::common::commands::GetApiActivity { count },
+                "kiapi.common.commands.GetApiActivity",
+            )?,
+            "GetApiActivity",
+        )?;
+        Ok(response.entries)
     }
 }
 

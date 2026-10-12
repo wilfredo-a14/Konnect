@@ -285,10 +285,31 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let ipc_address = &self.ctx.config.ipc_address;
+        let action = crate::tools::activity_log::describe(&params.name, &args);
+        crate::tools::activity_log::start(ipc_address, &call_id, &action, &args).await;
+
+        // A write recorded by an earlier call that never reached its reload
+        // must not be attributed to this one.
+        konnect_sexp::live_editor::take_live_writes();
+        let (mut result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        if let Some(note) = crate::tools::live_schematic::reload_written(ipc_address, &action).await
+        {
+            result.content.push(ToolContent::Text { text: note });
+        }
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);
+
+        crate::tools::activity_log::end(
+            ipc_address,
+            &call_id,
+            &action,
+            status != CallStatus::Ok,
+            dur_ms,
+            &format!("status: {}\n\n{}", status.as_str(), result_summary(&result)),
+        )
+        .await;
 
         info!(
             call_id = %call_id,
@@ -408,6 +429,24 @@ impl McpHandler {
                         ),
                         CallStatus::Error,
                         Some("invalid_argument".to_string()),
+                    )
+                }
+                Err(e) if kicad_editor_unsaved_path(&e).is_some() => {
+                    let path = kicad_editor_unsaved_path(&e)
+                        .expect("guard matched")
+                        .display()
+                        .to_string();
+                    (
+                        CallToolResult::error_kind(
+                            ToolErrorKind::Conflict {
+                                paths: vec![path.clone()],
+                            },
+                            format!(
+                                "Schematic '{path}' has unsaved changes in KiCad. Konnect did not modify it. Save (or revert) the schematic in KiCad, then retry; Konnect will then edit the file and KiCad will reload it."
+                            ),
+                        ),
+                        CallStatus::Error,
+                        Some("conflict".to_string()),
                     )
                 }
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
@@ -535,6 +574,22 @@ fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
     None
 }
 
+fn kicad_editor_unsaved_path(error: &anyhow::Error) -> Option<&std::path::Path> {
+    for cause in error.chain() {
+        if let Some(konnect_sexp::SexpError::KiCadEditorUnsaved { path }) =
+            cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return Some(path);
+        }
+        if let Some(konnect_schematic_editor::Error::KiCadEditorUnsaved { path }) =
+            cause.downcast_ref::<konnect_schematic_editor::Error>()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
     for cause in error.chain() {
         if let Some(konnect_sexp::SexpError::KiCadEditorLocked {
@@ -568,6 +623,19 @@ fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
         .filter_map(|v| v.as_str())
         .find(|key| args.get(*key).map(Value::is_null).unwrap_or(true))
         .map(str::to_string)
+}
+
+/// The result's text, as the API Activity panel shows it.
+fn result_summary(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .map(|c| match c {
+            ToolContent::Text { text } => text.clone(),
+            ToolContent::Image { mime_type, .. } => format!("[{mime_type} image]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn result_content_bytes(result: &CallToolResult) -> usize {

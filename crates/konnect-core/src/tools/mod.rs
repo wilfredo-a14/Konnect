@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+pub mod activity_log;
 #[cfg(test)]
 mod board_extents_tests;
 mod board_session;
@@ -22,6 +23,7 @@ mod lcsc_packages;
 pub mod library;
 mod library_footprint;
 pub(crate) mod live_board;
+pub mod live_schematic;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
 pub mod pcb_board;

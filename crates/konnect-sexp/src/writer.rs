@@ -19,6 +19,7 @@
 //! Edits **must** be applied in **reverse byte-offset order** so that earlier
 //! offsets are not invalidated by later insertions.
 
+use crate::live_editor::LiveEditorState;
 use crate::SexpError;
 use fs4::FileExt;
 use sha2::{Digest, Sha256};
@@ -222,14 +223,46 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
 /// Reads and non-design-document writes are unaffected.
+///
+/// A schematic whose live editor proves it holds no unsaved changes is the
+/// exception: see [`crate::live_editor`].
 pub(crate) fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
     let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
 
+    if let Some(verdict) = live_schematic_verdict(path, crate::live_editor::probe) {
+        return verdict;
+    }
+
     ensure_kicad_design_document_is_closed_with(path, &lock_path, |path| {
         std::fs::symlink_metadata(path).map(|_| ())
     })
+}
+
+/// The live editor's verdict on writing a schematic, or `None` when the
+/// sibling lock decides: for a board, or when no editor can vouch.
+fn live_schematic_verdict(
+    path: &Path,
+    probe: impl FnOnce(&Path) -> LiveEditorState,
+) -> Option<Result<(), SexpError>> {
+    let is_schematic = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"));
+    if !is_schematic {
+        return None;
+    }
+    match probe(path) {
+        LiveEditorState::Unmodified => {
+            crate::live_editor::record_live_write(path);
+            Some(Ok(()))
+        }
+        LiveEditorState::Modified => Some(Err(SexpError::KiCadEditorUnsaved {
+            path: path.to_path_buf(),
+        })),
+        LiveEditorState::Unknown => None,
+    }
 }
 
 fn ensure_kicad_design_document_is_closed_with(
@@ -1455,6 +1488,46 @@ mod atomic_write_tests {
             } if blocked_path.ends_with("design.kicad_sch")
                 && lock_path.ends_with("~design.kicad_sch.lck")
         ));
+    }
+
+    #[test]
+    fn unmodified_live_schematic_is_writable_and_recorded_for_reload() {
+        let path = Path::new("/project/live-unmodified.kicad_sch");
+
+        let verdict = live_schematic_verdict(path, |_| LiveEditorState::Unmodified);
+
+        assert!(matches!(verdict, Some(Ok(()))));
+        assert!(crate::live_editor::take_live_writes()
+            .iter()
+            .any(|write| write.path == path));
+    }
+
+    #[test]
+    fn modified_live_schematic_refuses_the_write() {
+        let path = Path::new("/project/live-modified.kicad_sch");
+
+        let verdict = live_schematic_verdict(path, |_| LiveEditorState::Modified);
+
+        assert!(matches!(
+            verdict,
+            Some(Err(SexpError::KiCadEditorUnsaved { path: refused })) if refused == path
+        ));
+    }
+
+    #[test]
+    fn unknown_live_state_leaves_the_decision_to_the_lock() {
+        let path = Path::new("/project/live-unknown.kicad_sch");
+
+        assert!(live_schematic_verdict(path, |_| LiveEditorState::Unknown).is_none());
+    }
+
+    #[test]
+    fn boards_are_never_probed() {
+        let verdict = live_schematic_verdict(Path::new("/project/board.kicad_pcb"), |_| {
+            panic!("a board write must not consult the schematic editor")
+        });
+
+        assert!(verdict.is_none());
     }
 
     #[test]

@@ -101,3 +101,76 @@ message StringResponse
 {
   string response = 1;
 }
+
+// fredo's-kicad only: a client names the operation behind the requests that follow, so the
+// API Activity panel can show it with those requests nested underneath.  Stock KiCad answers
+// AS_UNHANDLED, so clients should treat this as best effort.
+enum ActivityPhase
+{
+  AP_UNKNOWN = 0;
+
+  // An operation began.  Requests from the same client nest under it until its AP_END.
+  AP_START = 1;
+
+  // The operation started with the same call_id finished.
+  AP_END = 2;
+}
+
+// Returns google.protobuf.Empty
+message LogActivity
+{
+  // Pairs an AP_START with its AP_END
+  string call_id = 1;
+
+  ActivityPhase phase = 2;
+
+  // A short name for the operation, for example the client's tool name
+  string title = 3;
+
+  // Arguments (AP_START) or a result summary (AP_END).  The client redacts secrets before sending.
+  string detail = 4;
+
+  // AP_END only
+  bool failed = 5;
+
+  // AP_END only; 0 lets KiCad measure from the AP_START
+  uint64 duration_ms = 6;
+}
+
+// fredo's-kicad only: the newest entries of the API Activity log, oldest first.  Not itself
+// logged.  Stock KiCad answers AS_UNHANDLED.
+message GetApiActivity
+{
+  // How many entries, counting back from the newest; 0 for all that are kept
+  uint32 count = 1;
+}
+
+message ApiActivityEntry
+{
+  // Local time, ISO 8601 with milliseconds
+  string time = 1;
+
+  string client = 2;
+
+  // What happened, in words, e.g. "Move R101 from (1.00, 2.00) to (3.00, 4.00) mm"
+  string title = 3;
+
+  // "OK", "running", "failed", or an API status with its message
+  string status = 4;
+
+  bool failed = 5;
+
+  // Described by a client with LogActivity rather than a single request
+  bool operation = 6;
+
+  string call_id = 7;
+
+  double duration_ms = 8;
+
+  string detail = 9;
+}
+
+message GetApiActivityResponse
+{
+  repeated ApiActivityEntry entries = 1;
+}

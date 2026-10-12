@@ -1657,9 +1657,9 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
+        // Only `on_board` keeps a footprint off the board, as in KiCad's own
+        // Update PCB: `in_bom = no` marks board-only parts such as electrode
+        // pads, test pads and debug lands, which still belong on the board.
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -2560,6 +2560,7 @@ mod chunk_tests {
             message: Some(pack_any(
                 &kiapi::common::commands::RunAction {
                     action: action.into(),
+                    ..Default::default()
                 },
                 "kiapi.common.commands.RunAction",
             )),
@@ -3493,6 +3494,43 @@ mod tests {
         let net_change = plan_sync("netlist", &design, &board_with(vec![footprint]));
         assert_eq!(net_change.status, PlanStatus::Ready);
         assert_eq!(net_change.counts.pads_reassigned.planned, 1);
+    }
+
+    #[test]
+    fn excluded_from_bom_parts_still_reach_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let sheet = dir.path().join("root.kicad_sch");
+        let symbol = |uuid: &str, reference: &str, in_bom: &str, on_board: &str| {
+            format!(
+                "(symbol (lib_id \"x:y\") (in_bom {in_bom}) (on_board {on_board}) (dnp no) \
+                 (uuid \"{uuid}\") (instances (project \"p\" (path \"/\" (reference \"{reference}\") (unit 1)))))"
+            )
+        };
+        std::fs::write(
+            &sheet,
+            format!(
+                "(kicad_sch (uuid \"root\") {} {})",
+                symbol("pad", "E1", "no", "yes"),
+                symbol("label", "MK1", "yes", "no")
+            ),
+        )
+        .unwrap();
+        let mut design = ExportedDesign {
+            components: vec![resistor("E1", "/root/pad"), resistor("MK1", "/root/label")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+
+        apply_saved_symbol_flags(&[sheet], &mut design).unwrap();
+
+        let kept: Vec<_> = design
+            .components
+            .iter()
+            .map(|c| c.reference.as_str())
+            .collect();
+        assert_eq!(kept, ["E1"]);
+        assert_eq!(design.skipped.len(), 1);
+        assert_eq!(design.skipped[0].reference, "MK1");
     }
 
     #[test]

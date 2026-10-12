@@ -36,6 +36,7 @@ const SUBCOMMANDS: &[&str] = &[
     "status",
     "skill",
     "hook",
+    "activity-hook",
     "transaction",
 ];
 
@@ -99,6 +100,13 @@ async fn main() -> Result<()> {
         Cli::Subcommand("hook") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
             return install::print_hook_output(name);
+        }
+        Cli::Subcommand("activity-hook") => {
+            let mut input = String::new();
+            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_ok() {
+                konnect_core::tools::activity_log::post_claude_hook(&input);
+            }
+            return Ok(());
         }
         Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
         Cli::Subcommand(_) | Cli::Server => {}
@@ -181,6 +189,9 @@ async fn main() -> Result<()> {
         auto_load_toolsets: config.auto_load_toolsets,
         eager_toolsets: config.eager_toolsets,
     };
+    // Only the real server asks a running KiCad before writing a schematic it
+    // has open; tests and embedders keep the editor-lock rule alone.
+    konnect_core::tools::live_schematic::install_probe(&server_config.ipc_address);
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
@@ -279,6 +290,12 @@ fn print_help_for(subcommand: Option<&str>) {
         Some("hook") => {
             println!("konnect hook <name>\n");
             println!("Print one structured Claude hook response as JSON. Writes nothing.");
+        }
+        Some("activity-hook") => {
+            println!("konnect activity-hook < hook-event.json\n");
+            println!("Post a Claude Code PreToolUse/PostToolUse/PostToolUseFailure event");
+            println!("to the fredo KiCad fork's API Activity panel. Prints nothing and");
+            println!("always exits 0, so it never affects the command it reports.");
         }
         Some("transaction") => {
             println!("konnect transaction status <project-dir>");

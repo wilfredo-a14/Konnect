@@ -67,6 +67,7 @@ enum FrameType
   FT_SYMBOL_EDITOR        = 5;
   FT_FOOTPRINT_EDITOR     = 6;
   FT_DRAWING_SHEET_EDITOR = 7;
+  FT_3D_VIEWER            = 8;  // fredo's-kicad only
 }
 
 /**
