@@ -36,11 +36,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "run_editor_action",
-            "Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does, e.g. 'common.Control.zoomFitScreen', 'pcbnew.EditorControl.boardSetup', 'eeschema.EditorControl.schematicSetup' or 'common.SuiteControl.openPreferences'. Set deferred for actions that open a modal dialog (setup and preferences dialogs), so KiCad replies before the dialog blocks; close it afterwards with close_dialog. The agent cursor points at the button. Needs the fredo KiCad fork for deferred actions and schematic actions.",
+            "Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does, e.g. 'common.Control.zoomFitScreen', 'pcbnew.EditorControl.boardSetup', 'eeschema.EditorControl.schematicSetup' or 'common.SuiteControl.openPreferences'. Set deferred for actions that open a modal dialog (setup and preferences dialogs), so KiCad replies before the dialog blocks; close it afterwards with close_dialog. Editor 'simulator' runs 'eeschema.Simulation.*' actions (e.g. runAllSimulations) in the open simulator; open it first with editor 'schematic', action 'eeschema.EditorControl.showSimulator', deferred. Editor 'project' runs the project manager's 'kicad.Control.showAgentHub' (the AI Agent page) and 'kicad.Control.showLocalHistory'. The agent cursor points at the button. Needs the fredo KiCad fork for deferred actions, schematic and simulator actions.",
             json!({
                 "type": "object",
                 "properties": {
-                    "editor": { "type": "string", "enum": ["pcb", "schematic", "footprint", "3d"] },
+                    "editor": { "type": "string", "enum": ["pcb", "schematic", "simulator", "footprint", "3d", "project"] },
                     "action": { "type": "string", "description": "The action name, e.g. common.Control.zoomFitScreen, or 3DViewer.Control.viewTop in the 3D viewer" },
                     "deferred": { "type": "boolean", "description": "Run after KiCad replies; required for actions that open a modal dialog", "default": false }
                 },
@@ -71,6 +71,22 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["button"]
             }),
             |args, ctx| async move { handle_close_dialog(args, ctx).await }
+        ),
+        tool!(
+            "get_api_activity",
+            "Read KiCad's API Activity log, oldest first: every API request answered in words, the operations clients named, and what KiCad itself reported under client 'kicad', such as 'ERC finished: ...', 'DRC finished: ...', each simulator analysis and 'All analyses run: N of M completed'. This is how to see the result of run_checker, edit_item_properties, close_dialog and simulator runs, which return before the work ends. Filter with contains (case-insensitive, over title, detail, client and status), client, since (an entry time from an earlier read; only newer entries are returned) and failed_only. Needs the fredo KiCad fork.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0, "maximum": 5000, "default": 50, "description": "Newest entries to return after filtering; 0 for every match" },
+                    "contains": { "type": "string" },
+                    "client": { "type": "string", "description": "Only entries from this client, e.g. kicad, or a prefix such as konnect" },
+                    "since": { "type": "string", "description": "Only entries after this time, as returned in newest_time" },
+                    "failed_only": { "type": "boolean", "default": false }
+                },
+                "required": []
+            }),
+            |args, ctx| async move { handle_get_api_activity(args, ctx).await }
         ),
         tool!(
             "capture_3d_view",
@@ -255,8 +271,12 @@ fn frame_for(editor: &str) -> Option<konnect_ipc::gen::kiapi::common::types::Fra
     use konnect_ipc::gen::kiapi::common::types::FrameType;
     match editor {
         "pcb" => Some(FrameType::FtPcbEditor),
+        // The fork's schematic handler passes eeschema.Simulation.* on to the simulator.
         "schematic" => Some(FrameType::FtSchematicEditor),
+        "simulator" => Some(FrameType::FtSpiceSimulator),
         "footprint" => Some(FrameType::FtFootprintEditor),
+        // The project manager runs only kicad.Control.showAgentHub and showLocalHistory.
+        "project" => Some(FrameType::FtProjectManager),
         "3d" => Some(FrameType::Ft3dViewer),
         _ => None,
     }
@@ -300,7 +320,7 @@ async fn handle_run_editor_action(
     let Some(frame) = frame_for(&editor) else {
         return Ok(invalid_arg(
             "editor",
-            "expected 'pcb', 'schematic', 'footprint' or '3d'",
+            "expected 'pcb', 'schematic', 'simulator', 'footprint', '3d' or 'project'",
         ));
     };
     let action = match require_str(args, "action") {
@@ -322,17 +342,28 @@ async fn handle_run_editor_action(
         konnect_ipc::KiCadIpcClient::new(address).run_action_in(frame, &action_ipc, deferred)
     })
     .await?;
+    use konnect_ipc::gen::kiapi::common::commands::RunActionStatus;
     match result {
-        Ok(true) => Ok(CallToolResult::json(&json!({
+        Ok(RunActionStatus::RasOk) => Ok(CallToolResult::json(&json!({
             "ran": action,
             "editor": editor,
             "deferred": deferred,
             "note": if deferred { "KiCad runs the action right after this reply; a dialog it opens stays open until close_dialog or the person closes it" } else { "the action ran" }
         }))),
-        Ok(false) => Ok(invalid_arg(
+        Ok(RunActionStatus::RasFrameNotOpen) => Ok(editor_unavailable(&if editor == "simulator"
+            || action.starts_with("eeschema.Simulation.")
+        {
+            format!("the simulator is not open, so '{action}' did not run; open it with run_editor_action(editor='schematic', action='eeschema.EditorControl.showSimulator', deferred=true) and try again")
+        } else {
+            format!("the window '{action}' runs in is not open, so it did not run")
+        })),
+        Ok(RunActionStatus::RasInvalid) => Ok(invalid_arg(
             "action",
             &format!("the {editor} editor has no action named '{action}'"),
         )),
+        Ok(status) => Ok(editor_unavailable(&format!(
+            "KiCad answered {status:?} for '{action}' in the {editor} editor"
+        ))),
         Err(error) => Ok(editor_unavailable(&format!(
             "KiCad did not run '{action}' in the {editor} editor: {error:#}"
         ))),
@@ -413,6 +444,86 @@ async fn handle_close_dialog(
             "KiCad did not close the dialog: {error:#}"
         ))),
     }
+}
+
+async fn handle_get_api_activity(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let count = args
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(50)
+        .min(5000) as usize;
+    let contains = opt_str(args, "contains").map(str::to_lowercase);
+    let client = opt_str(args, "client").map(str::to_string);
+    let since = opt_str(args, "since").map(str::to_string);
+    let failed_only = args
+        .get("failed_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let Some(address) = super::live_schematic::endpoint(&ctx.config.ipc_address) else {
+        return Ok(editor_unavailable(
+            "no KiCad IPC endpoint found; start KiCad with its API server enabled",
+        ));
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        konnect_ipc::KiCadIpcClient::new(address).get_api_activity(0)
+    })
+    .await?;
+    let entries = match result {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Ok(editor_unavailable(&format!(
+                "KiCad did not return its API Activity log (it needs the fredo fork): {error:#}"
+            )))
+        }
+    };
+    let kept = entries.len();
+    let newest_time = entries.last().map(|entry| entry.time.clone());
+    // Times are ISO 8601 with milliseconds in one zone, so they order as strings.
+    let mut matched: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| since.as_deref().map_or(true, |since| entry.time.as_str() > since))
+        .filter(|entry| client.as_deref().map_or(true, |client| entry.client.starts_with(client)))
+        .filter(|entry| !failed_only || entry.failed)
+        .filter(|entry| {
+            contains.as_deref().map_or(true, |needle| {
+                [&entry.title, &entry.detail, &entry.client, &entry.status]
+                    .iter()
+                    .any(|text| text.to_lowercase().contains(needle))
+            })
+        })
+        .collect();
+    let total = matched.len();
+    if count > 0 && matched.len() > count {
+        matched.drain(..matched.len() - count);
+    }
+    let rows: Vec<_> = matched
+        .iter()
+        .map(|entry| {
+            json!({
+                "time": entry.time,
+                "client": entry.client,
+                "title": entry.title,
+                "status": entry.status,
+                "failed": entry.failed,
+                "operation": entry.operation,
+                "call_id": entry.call_id,
+                "duration_ms": entry.duration_ms,
+                "detail": entry.detail,
+            })
+        })
+        .collect();
+    Ok(CallToolResult::json(&json!({
+        "entries": rows,
+        "matched": total,
+        "returned": rows.len(),
+        "kept_by_kicad": kept,
+        "newest_time": newest_time,
+        "note": "pass newest_time as since on the next read to get only what happened after it"
+    })))
 }
 
 async fn handle_capture_3d_view(

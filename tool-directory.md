@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **237 registered tools** + **7 always-visible meta-tools** = **244 total**
+- **238 registered tools** + **7 always-visible meta-tools** = **245 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -70,16 +70,17 @@ and Windows servers do not.
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
-### `editor_navigation` · 13 tools
+### `editor_navigation` · 14 tools
 **Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.
 **Source:** [`crates/konnect-core/src/tools/editor_navigation.rs`](crates/konnect-core/src/tools/editor_navigation.rs)
 
 | Tool | Description |
 |------|-------------|
 | `open_editor` | Open a KiCad editor window, or bring it to the front, as the project manager's launcher buttons do (schematic, PCB, symbol, footprint, or the project manager), from whichever KiCad window is in front. Needs the fredo KiCad fork; refuses instead of prompting when no project is open or the project has no such file. |
-| `run_editor_action` | Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does; `deferred` for actions that open a modal dialog (setup and preferences), which close_dialog then dismisses. The agent cursor points at the button. Fredo fork for deferred and schematic actions. |
+| `run_editor_action` | Run a KiCad editor action by name in the PCB or schematic editor, as clicking its toolbar button or menu entry does; `deferred` for actions that open a modal dialog (setup and preferences), which close_dialog then dismisses; editor `simulator` runs `eeschema.Simulation.*` actions in the open simulator. The agent cursor points at the button. Fredo fork for deferred, schematic and simulator actions. |
 | `run_checker` | Run DRC (PCB editor) or ERC (schematic editor) as a person would: open the checker dialog, click Run, leave the results on screen; the API Activity log reports the counts. Fredo fork; the editor must be open. |
 | `close_dialog` | Click OK or Cancel on the frontmost KiCad dialog with the agent cursor on the button; reports the dialog's title. Fredo fork. |
+| `get_api_activity` | Read KiCad's API Activity log, oldest first, filtered by text, client, time and failure: the results of run_checker ('ERC finished: ...'), edit_item_properties, close_dialog and simulator runs ('All analyses run: N of M completed'), which return before the work ends. Fredo fork. |
 | `capture_3d_view` | Save what the 3D viewer shows as a PNG at an absolute path, so the rendered board can be inspected without a screenshot; open it with open_editor('3d') and set the view with run_editor_action('3d', …). Fredo fork. |
 | `open_footprint_editor` | Load a library footprint into the footprint editor, as its library tree does; its pads, graphics and fields are then reachable through the board item API. Refused while the editor holds unsaved changes. Fredo fork. |
 | `save_footprint` | Save the footprint the footprint editor holds back to its library. Fredo fork. |

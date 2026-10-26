@@ -4893,13 +4893,15 @@ impl KiCadIpcClient {
 
     /// Run an editor action by name in `frame`'s editor. With `deferred`, KiCad
     /// replies first and runs it after, for actions that open a modal dialog
-    /// (fredo fork). Returns whether the editor knew the action.
+    /// (fredo fork). Returns KiCad's status: RAS_OK when the action ran,
+    /// RAS_INVALID when the editor has no such action, RAS_FRAME_NOT_OPEN when
+    /// the window it targets (e.g. the simulator) is not open.
     pub fn run_action_in(
         &self,
         frame: kiapi::common::types::FrameType,
         action: &str,
         deferred: bool,
-    ) -> Result<bool> {
+    ) -> Result<kiapi::common::commands::RunActionStatus> {
         let response = unpack_required::<kiapi::common::commands::RunActionResponse>(
             self.send_command(
                 &kiapi::common::commands::RunAction {
@@ -4911,7 +4913,10 @@ impl KiCadIpcClient {
             )?,
             "RunAction",
         )?;
-        Ok(response.status == kiapi::common::commands::RunActionStatus::RasOk as i32)
+        Ok(
+            kiapi::common::commands::RunActionStatus::try_from(response.status)
+                .unwrap_or(kiapi::common::commands::RunActionStatus::RasUnknown),
+        )
     }
 
     /// Open the DRC (board) or ERC (schematic) dialog of the editor holding
