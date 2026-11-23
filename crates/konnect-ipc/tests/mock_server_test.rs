@@ -2910,6 +2910,97 @@ fn add_is_verified_beside_a_selected_object_without_a_kiid() {
     );
 }
 
+/// KiCad 10.99's own answer to `GetSelection` with nine kinds of schematic
+/// item selected (the fixture's README says how it was captured). Each is
+/// listed under its kind with the KIID KiCad's own protocol reads from it.
+#[test]
+fn kicad_10_99s_captured_schematic_selection_is_read_in_full() {
+    let captured = prost_types::Any {
+        type_url: "type.googleapis.com/kiapi.common.commands.SelectionResponse".to_string(),
+        value: include_bytes!("fixtures/schematic_selection_kicad10_99.ipc.bin").to_vec(),
+    };
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_sheet_document(&["root", "child"]),
+            ]));
+        }
+        Some(reply_with(captured.clone()))
+    });
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_sheet_target(&["root", "child"]))
+        .expect("KiCad 10.99's selection is readable");
+    assert!(observation
+        .selected_objects
+        .iter()
+        .all(|object| object.kiid_evidence == IpcSelectedKiidEvidence::KnownTypeField));
+    let listed = observation
+        .selected_objects
+        .iter()
+        .map(|object| {
+            (
+                object
+                    .protocol_type
+                    .strip_prefix("kiapi.schematic.types.")
+                    .expect("a schematic type"),
+                object.object_type.as_str(),
+                object.kiid.as_deref().expect("a KIID"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (
+                "LocalLabel",
+                "schematic_label",
+                "0cc999dc-a82a-492e-b7dc-f2ddfc0c4446"
+            ),
+            (
+                "SchematicText",
+                "schematic_text",
+                "724e8a92-9414-4c2d-a4db-0a05f803aa76"
+            ),
+            (
+                "SchematicSymbolInstance",
+                "schematic_symbol",
+                "f4a4c65b-674b-4d0f-a935-3abb456ee78d"
+            ),
+            (
+                "NoConnectMarker",
+                "schematic_no_connect",
+                "b93eff96-b310-4077-a407-0326f43c6d37"
+            ),
+            (
+                "Junction",
+                "schematic_junction",
+                "bd264233-12da-4bff-b641-56d25eeb10aa"
+            ),
+            (
+                "GlobalLabel",
+                "schematic_global_label",
+                "16dbdde3-7721-4e11-ad75-ff8819f36707"
+            ),
+            (
+                "HierarchicalLabel",
+                "schematic_hierarchical_label",
+                "038860db-fcfb-42e7-9554-36fe52fb6779"
+            ),
+            (
+                "SheetSymbol",
+                "schematic_sheet",
+                "871ff605-89eb-4a58-9a5b-f6e44d75f9e2"
+            ),
+            (
+                "SchematicLine",
+                "schematic_line",
+                "08527288-3601-4b95-b2e8-c2d72ccef881"
+            ),
+        ]
+    );
+}
+
 #[test]
 fn document_disappearing_during_selection_readback_is_stale_editor_state() {
     let open_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
