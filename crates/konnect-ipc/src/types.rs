@@ -112,15 +112,34 @@ pub struct IpcEditorStateObservation {
     pub limitations: Vec<String>,
 }
 
+/// How a selected object's KIID was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcSelectedKiidEvidence {
+    /// From the field that holds the KIID in this protobuf type.
+    KnownTypeField,
+    /// The type is not one Konnect knows; the KIID comes from the message's
+    /// lowest-numbered field that holds nothing but a KIID, which is where
+    /// every known type keeps its own. Good enough to hand back to a selection
+    /// change, whose readback checks it.
+    ProbedField,
+    /// No KIID could be read; `kiid` is null.
+    Unreadable,
+}
+
 /// One selected object observed from the exact requested live document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcSelectedObject {
     /// Stable KiCad object identifier (KIID/UUID), never a display reference.
-    pub kiid: String,
-    /// Semantic object kind derived from the exact protobuf type URL.
+    /// Null when the object carries none Konnect can read: a type it does not
+    /// know with no KIID candidate, or a type KiCad serializes without one.
+    pub kiid: Option<String>,
+    /// Semantic object kind derived from the exact protobuf type URL, or
+    /// `unrecognized` for a type Konnect does not know.
     pub object_type: String,
     /// Full protobuf type carried by KiCad, retained as decoding evidence.
     pub protocol_type: String,
+    pub kiid_evidence: IpcSelectedKiidEvidence,
 }
 
 /// Selection readback bound to one exact live editor/document/sheet context.
@@ -209,8 +228,6 @@ pub enum IpcSelectionObservationErrorKind {
     WrongSheetInstance,
     AmbiguousDocument,
     StaleEditorState,
-    UnsupportedObjectType,
-    MalformedSelectedObject,
 }
 
 /// A selection could not be attributed to the exact requested live context.

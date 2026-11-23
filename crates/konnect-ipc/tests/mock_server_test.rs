@@ -8,9 +8,10 @@
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
 use konnect_ipc::{
-    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
-    IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
-    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient, PingOutcome,
+    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectedKiidEvidence,
+    IpcSelectionMutation, IpcSelectionMutationError, IpcSelectionMutationErrorKind,
+    IpcSelectionObservationError, IpcSelectionObservationErrorKind, IpcSheetInstancePath,
+    KiCadIpcClient, PingOutcome,
 };
 use nng::options::Options;
 use prost::Message;
@@ -2542,7 +2543,10 @@ fn selection_observation_is_bound_to_the_exact_board_and_returns_stable_kiids() 
     assert_eq!(observation.editor, IpcEditorKind::Pcb);
     assert_eq!(observation.project, navigation_project_identity());
     assert_eq!(observation.selected_objects.len(), 1);
-    assert_eq!(observation.selected_objects[0].kiid, "footprint-kiid");
+    assert_eq!(
+        observation.selected_objects[0].kiid.as_deref(),
+        Some("footprint-kiid")
+    );
     assert_eq!(observation.selected_objects[0].object_type, "pcb_footprint");
     assert_eq!(
         captured.lock().unwrap().as_deref(),
@@ -2573,7 +2577,10 @@ fn schematic_selection_preserves_the_exact_sheet_instance_and_label_kiid() {
     let observation = KiCadIpcClient::new(&mock.url)
         .observe_selection(&target)
         .expect("schematic selection is valid");
-    assert_eq!(observation.selected_objects[0].kiid, "label-kiid");
+    assert_eq!(
+        observation.selected_objects[0].kiid.as_deref(),
+        Some("label-kiid")
+    );
     assert_eq!(
         observation.selected_objects[0].object_type,
         "schematic_label"
@@ -2645,37 +2652,262 @@ fn duplicate_document_identity_is_ambiguous_not_first_match() {
     );
 }
 
+/// A selected item reduced to what the readback uses: a message of the named
+/// type with a KIID in `field`. This is how the KiCad 10.99 types reach these
+/// tests, since the vendored 10.0 protocol has no message for them.
+fn item_with_kiid(type_name: &str, field: u8, id: &str) -> prost_types::Any {
+    let inner = kiid(id).encode_to_vec();
+    let mut value = vec![field << 3 | 2, u8::try_from(inner.len()).unwrap()];
+    value.extend(inner);
+    prost_types::Any {
+        type_url: format!("type.googleapis.com/{type_name}"),
+        value,
+    }
+}
+
+/// KiCad 10.99's `SchematicField`: a name in field 2 and no KIID.
+fn schematic_field_item() -> prost_types::Any {
+    let mut value = vec![2 << 3 | 2, 9];
+    value.extend(b"Reference");
+    prost_types::Any {
+        type_url: "type.googleapis.com/kiapi.schematic.types.SchematicField".to_string(),
+        value,
+    }
+}
+
+const WIRE_KIID: &str = "08527288-3601-4b95-b2e8-c2d72ccef881";
+const LABEL_KIID: &str = "0cc999dc-a82a-492e-b7dc-f2ddfc0c4446";
+const SYMBOL_KIID: &str = "f4a4c65b-674b-4d0f-a935-3abb456ee78d";
+
 #[test]
-fn malformed_or_unsupported_selected_objects_fail_the_whole_observation() {
-    let items = [
+fn a_kicad_10_99_schematic_selection_lists_wire_label_symbol_and_field() {
+    let items = vec![
+        item_with_kiid("kiapi.schematic.types.SchematicLine", 1, WIRE_KIID),
+        item_with_kiid("kiapi.schematic.types.LocalLabel", 1, LABEL_KIID),
+        item_with_kiid(
+            "kiapi.schematic.types.SchematicSymbolInstance",
+            1,
+            SYMBOL_KIID,
+        ),
+        schematic_field_item(),
+    ];
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_sheet_document(&["root", "child"]),
+            ]));
+        }
+        Some(selection_response(items.clone()))
+    });
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_sheet_target(&["root", "child"]))
+        .expect("a 10.99 selection is readable");
+    let listed = observation
+        .selected_objects
+        .iter()
+        .map(|object| {
+            (
+                object.object_type.as_str(),
+                object.kiid.as_deref(),
+                object.kiid_evidence,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (
+                "schematic_line",
+                Some(WIRE_KIID),
+                IpcSelectedKiidEvidence::KnownTypeField
+            ),
+            (
+                "schematic_label",
+                Some(LABEL_KIID),
+                IpcSelectedKiidEvidence::KnownTypeField
+            ),
+            (
+                "schematic_symbol",
+                Some(SYMBOL_KIID),
+                IpcSelectedKiidEvidence::KnownTypeField
+            ),
+            ("schematic_field", None, IpcSelectedKiidEvidence::Unreadable),
+        ]
+    );
+}
+
+#[test]
+fn unknown_or_kiidless_selected_objects_are_listed_instead_of_failing_the_observation() {
+    let items = vec![
+        // A known type that arrives without its KIID.
         builders::pack_any(
             &kiapi::board::types::FootprintInstance::default(),
             "kiapi.board.types.FootprintInstance",
         ),
+        // A type the table does not name, with nothing to read.
         prost_types::Any {
             type_url: "type.googleapis.com/kiapi.board.types.ReferenceImage".to_string(),
             value: Vec::new(),
         },
+        // The same type carrying a KIID.
+        item_with_kiid("kiapi.board.types.ReferenceImage", 1, WIRE_KIID),
     ];
-    let expected = [
-        IpcSelectionObservationErrorKind::MalformedSelectedObject,
-        IpcSelectionObservationErrorKind::UnsupportedObjectType,
-    ];
-    for (item, expected) in items.into_iter().zip(expected) {
-        let mock = spawn_mock(move |request| {
-            let message = request.message.expect("command");
-            if message.type_url.ends_with("GetOpenDocuments") {
-                return Some(open_navigation_documents_response(vec![
-                    navigation_board_document(),
-                ]));
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_board_document(),
+            ]));
+        }
+        Some(selection_response(items.clone()))
+    });
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect("no selected object fails the observation");
+    let listed = observation
+        .selected_objects
+        .iter()
+        .map(|object| {
+            (
+                object.object_type.as_str(),
+                object.protocol_type.as_str(),
+                object.kiid.as_deref(),
+                object.kiid_evidence,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (
+                "pcb_footprint",
+                "kiapi.board.types.FootprintInstance",
+                None,
+                IpcSelectedKiidEvidence::Unreadable
+            ),
+            (
+                "unrecognized",
+                "kiapi.board.types.ReferenceImage",
+                None,
+                IpcSelectedKiidEvidence::Unreadable
+            ),
+            (
+                "unrecognized",
+                "kiapi.board.types.ReferenceImage",
+                Some(WIRE_KIID),
+                IpcSelectedKiidEvidence::ProbedField
+            ),
+        ]
+    );
+}
+
+/// A schematic editor whose selection is a list of arbitrary items. Clear
+/// empties it and add appends a symbol, when `apply_mutation` is set.
+fn spawn_sheet_selection_mock(initial: Vec<prost_types::Any>, apply_mutation: bool) -> MockKicad {
+    let selection = Arc::new(Mutex::new(initial));
+    spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_sheet_document(&["root", "child"]),
+            ]));
+        }
+        let mut selection = selection.lock().unwrap();
+        if message.type_url.ends_with("ClearSelection") {
+            if apply_mutation {
+                selection.clear();
             }
-            Some(selection_response(vec![item.clone()]))
-        });
-        let error = KiCadIpcClient::new(&mock.url)
-            .observe_selection(&navigation_board_target())
-            .expect_err("unverifiable selected object must fail closed");
-        assert_eq!(selection_kind(&error), expected, "{error:#}");
-    }
+        } else if message.type_url.ends_with("AddToSelection") {
+            let command =
+                kiapi::common::commands::AddToSelection::decode(message.value.as_slice()).unwrap();
+            if apply_mutation {
+                selection.extend(command.items.iter().map(|id| {
+                    item_with_kiid(
+                        "kiapi.schematic.types.SchematicSymbolInstance",
+                        1,
+                        &id.value,
+                    )
+                }));
+            }
+        } else if !message.type_url.ends_with("GetSelection") {
+            panic!("unexpected request {}", message.type_url);
+        }
+        Some(selection_response(selection.clone()))
+    })
+}
+
+#[test]
+fn clear_succeeds_whatever_is_selected() {
+    let mock = spawn_sheet_selection_mock(
+        vec![
+            item_with_kiid(
+                "kiapi.schematic.types.SchematicSymbolInstance",
+                1,
+                SYMBOL_KIID,
+            ),
+            schematic_field_item(),
+            prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.schematic.types.NotYetInvented".to_string(),
+                value: vec![0xff; 5],
+            },
+        ],
+        true,
+    );
+    let result = KiCadIpcClient::new(&mock.url)
+        .mutate_selection(
+            &navigation_sheet_target(&["root", "child"]),
+            IpcSelectionMutation::Clear,
+            &[],
+        )
+        .expect("clear does not depend on what was selected");
+    assert_eq!(result.before.selected_objects.len(), 3);
+    assert!(result.after.selected_objects.is_empty());
+}
+
+#[test]
+fn a_clear_that_leaves_an_object_without_a_kiid_selected_is_a_mismatch() {
+    let mock = spawn_sheet_selection_mock(vec![schematic_field_item()], false);
+    let error = KiCadIpcClient::new(&mock.url)
+        .mutate_selection(
+            &navigation_sheet_target(&["root", "child"]),
+            IpcSelectionMutation::Clear,
+            &[],
+        )
+        .expect_err("an object is still selected");
+    let typed = IpcSelectionMutationError::from_error(&error).expect("typed mutation error");
+    assert_eq!(typed.kind, IpcSelectionMutationErrorKind::ReadbackMismatch);
+    assert!(typed.before_kiids.is_empty() && typed.after_kiids.is_empty());
+    assert!(
+        typed.reason.contains("no readable KIID"),
+        "{}",
+        typed.reason
+    );
+}
+
+#[test]
+fn add_is_verified_beside_a_selected_object_without_a_kiid() {
+    let mock = spawn_sheet_selection_mock(vec![schematic_field_item()], true);
+    let result = KiCadIpcClient::new(&mock.url)
+        .mutate_selection(
+            &navigation_sheet_target(&["root", "child"]),
+            IpcSelectionMutation::Add,
+            &[SYMBOL_KIID.to_string()],
+        )
+        .expect("the added symbol is read back");
+    let after = result
+        .after
+        .selected_objects
+        .iter()
+        .map(|object| (object.object_type.as_str(), object.kiid.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after,
+        [
+            ("schematic_field", None),
+            ("schematic_symbol", Some(SYMBOL_KIID))
+        ]
+    );
 }
 
 #[test]
@@ -2809,7 +3041,7 @@ fn clear_add_and_remove_selection_are_proven_by_exact_readback() {
             .after
             .selected_objects
             .iter()
-            .map(|object| object.kiid.clone())
+            .filter_map(|object| object.kiid.clone())
             .collect::<Vec<_>>();
         observed.sort();
         assert_eq!(observed, expected);

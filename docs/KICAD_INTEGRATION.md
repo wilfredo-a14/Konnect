@@ -78,12 +78,21 @@ strings.
 `KiCadIpcClient::observe_selection` accepts one exact editor/document identity
 from that observation, matches it before issuing `GetSelection`, and repeats
 the open-document read afterward because KiCad's `SelectionResponse` carries
-no response header. Every returned item is dispatched by its full protobuf
-type URL and must contain a non-empty KIID; an unknown or malformed selected
-item fails the entire observation rather than being dropped. The vendored
-schematic protobuf currently decodes line and label selections. Schematic
-symbols and other unmodelled types remain explicitly unsupported until KiCad
-provides stable typed serialization for them.
+no response header. Every returned item is listed; none is dropped and none
+fails the observation. `konnect_ipc::selected` identifies an item from its
+full protobuf type URL and reads only its KIID, from the field number that
+type keeps it in, so the readback does not depend on the rest of the message.
+That is what lets one table serve both protocol generations: KiCad 10.0, whose
+`.proto` files are the vendored ones, and KiCad 10.99, which renamed `Line` to
+`SchematicLine`, serializes symbols, junctions, no-connects, sheets and other
+schematic items 10.0 had no message for, and changed the layout of the label
+messages while keeping their names. An item of a type the table does not name
+is listed with `object_type` `unrecognized`, its `protocol_type`, and the KIID
+from its lowest-numbered field that holds nothing but one, which is where
+every known type keeps its own; `kiid` is null when there is no such field,
+and for types KiCad serializes without a KIID (a schematic field). `kiid_evidence` records which of these applies. KiCad 10.0's schematic
+editor does not handle the selection commands at all, so there the schematic
+selection tools report `unsupported_capability`.
 
 Navigation target resolution keeps two evidence channels in the same result
 without merging them. `GetOpenDocuments` proves that the exact requested live
@@ -100,6 +109,9 @@ explicit saved project/document/sheet. The transport response is not treated
 as success: Konnect performs a fresh exact-context `GetSelection`, compares the
 entire observed set with the expected before/after transition, and returns a
 structured `readback_mismatch` if KiCad did not make precisely that change.
+Selected objects listed without a KIID count too: add and remove must leave as
+many as they found, and clear must leave nothing selected. Because no selected
+object can fail the readback, clear works whatever is selected.
 Duplicate or empty KIID requests are rejected before IPC.
 
 `resolve_cross_probe_target` maps an exact schematic symbol to its PCB

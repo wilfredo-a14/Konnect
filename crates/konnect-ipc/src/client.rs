@@ -1653,11 +1653,14 @@ impl KiCadIpcClient {
             self.send_command(&command, "kiapi.common.commands.GetSelection")?,
             "GetSelection",
         )?;
+        // Identifying an item cannot fail: whatever KiCad reports as selected
+        // is listed, so no selection can make this readback, or the `clear`
+        // that starts with it, unusable.
         let selected_objects = response
             .items
             .iter()
-            .map(|item| decode_selected_object(requested.editor, item))
-            .collect::<Result<Vec<_>>>()?;
+            .map(crate::selected::identify_selected_object)
+            .collect::<Vec<_>>();
 
         let after = self
             .resolve_selection_document(requested)
@@ -1795,14 +1798,33 @@ impl KiCadIpcClient {
             }
         }
         let expected_kiids = expected.into_iter().collect::<Vec<_>>();
-        if expected_kiids != after_kiids {
+        // Objects listed without a KIID cannot be named in a request, so add
+        // and remove must leave as many as they found and clear must leave
+        // none.
+        let expected_without_kiid = match operation {
+            IpcSelectionMutation::Clear => 0,
+            IpcSelectionMutation::Add | IpcSelectionMutation::Remove => {
+                selection_without_kiid(&before)
+            }
+        };
+        let mismatch = if expected_kiids != after_kiids {
+            Some("post-operation GetSelection did not match the requested exact set transition")
+        } else if expected_without_kiid != selection_without_kiid(&after) {
+            Some(
+                "post-operation GetSelection matched every KIID, but not the expected number of \
+                 selected objects that carry no readable KIID",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = mismatch {
             return Err(selection_mutation_error(
                 operation,
                 requested_kiids,
                 before_kiids,
                 after_kiids,
                 IpcSelectionMutationErrorKind::ReadbackMismatch,
-                "post-operation GetSelection did not match the requested exact set transition",
+                reason,
             ));
         }
 
@@ -5420,162 +5442,23 @@ fn document_specifier_label(document: &kiapi::common::types::DocumentSpecifier) 
         .unwrap_or_else(|_| "malformed live document".to_string())
 }
 
-fn decode_selected_object(
-    editor: IpcEditorKind,
-    item: &prost_types::Any,
-) -> Result<IpcSelectedObject> {
-    let protocol_type = crate::builders::any_type_name(item);
-    macro_rules! selected {
-        ($message:ty, $kind:literal, $id:expr) => {{
-            let decoded: $message = unpack_any(item).map_err(|error| {
-                malformed_selected_object(editor, protocol_type, format!("decode failed: {error}"))
-            })?;
-            selected_object_from_id(editor, protocol_type, $kind, $id(&decoded))
-        }};
-    }
-
-    match protocol_type {
-        "kiapi.board.types.FootprintInstance" => selected!(
-            kiapi::board::types::FootprintInstance,
-            "pcb_footprint",
-            |value: &kiapi::board::types::FootprintInstance| value.id.clone()
-        ),
-        "kiapi.board.types.Pad" => selected!(
-            kiapi::board::types::Pad,
-            "pcb_pad",
-            |value: &kiapi::board::types::Pad| value.id.clone()
-        ),
-        "kiapi.board.types.BoardGraphicShape" => selected!(
-            kiapi::board::types::BoardGraphicShape,
-            "pcb_shape",
-            |value: &kiapi::board::types::BoardGraphicShape| value.id.clone()
-        ),
-        "kiapi.board.types.BoardText" => selected!(
-            kiapi::board::types::BoardText,
-            "pcb_text",
-            |value: &kiapi::board::types::BoardText| value.id.clone()
-        ),
-        "kiapi.board.types.BoardTextBox" => selected!(
-            kiapi::board::types::BoardTextBox,
-            "pcb_text_box",
-            |value: &kiapi::board::types::BoardTextBox| value.id.clone()
-        ),
-        "kiapi.board.types.Track" => selected!(
-            kiapi::board::types::Track,
-            "pcb_trace",
-            |value: &kiapi::board::types::Track| value.id.clone()
-        ),
-        "kiapi.board.types.Via" => selected!(
-            kiapi::board::types::Via,
-            "pcb_via",
-            |value: &kiapi::board::types::Via| value.id.clone()
-        ),
-        "kiapi.board.types.Arc" => selected!(
-            kiapi::board::types::Arc,
-            "pcb_arc",
-            |value: &kiapi::board::types::Arc| value.id.clone()
-        ),
-        "kiapi.board.types.Dimension" => selected!(
-            kiapi::board::types::Dimension,
-            "pcb_dimension",
-            |value: &kiapi::board::types::Dimension| value.id.clone()
-        ),
-        "kiapi.board.types.Zone" => selected!(
-            kiapi::board::types::Zone,
-            "pcb_zone",
-            |value: &kiapi::board::types::Zone| value.id.clone()
-        ),
-        "kiapi.board.types.Group" => selected!(
-            kiapi::board::types::Group,
-            "pcb_group",
-            |value: &kiapi::board::types::Group| value.id.clone()
-        ),
-        "kiapi.board.types.Field" => selected!(
-            kiapi::board::types::Field,
-            "pcb_field",
-            |value: &kiapi::board::types::Field| value
-                .text
-                .as_ref()
-                .and_then(|text| text.id.clone())
-        ),
-        "kiapi.schematic.types.Line" => selected!(
-            kiapi::schematic::types::Line,
-            "schematic_line",
-            |value: &kiapi::schematic::types::Line| value.id.clone()
-        ),
-        "kiapi.schematic.types.LocalLabel" => selected!(
-            kiapi::schematic::types::LocalLabel,
-            "schematic_label",
-            |value: &kiapi::schematic::types::LocalLabel| value.id.clone()
-        ),
-        "kiapi.schematic.types.GlobalLabel" => selected!(
-            kiapi::schematic::types::GlobalLabel,
-            "schematic_global_label",
-            |value: &kiapi::schematic::types::GlobalLabel| value.id.clone()
-        ),
-        "kiapi.schematic.types.HierarchicalLabel" => selected!(
-            kiapi::schematic::types::HierarchicalLabel,
-            "schematic_hierarchical_label",
-            |value: &kiapi::schematic::types::HierarchicalLabel| value.id.clone()
-        ),
-        "kiapi.schematic.types.DirectiveLabel" => selected!(
-            kiapi::schematic::types::DirectiveLabel,
-            "schematic_directive_label",
-            |value: &kiapi::schematic::types::DirectiveLabel| value.id.clone()
-        ),
-        _ => Err(anyhow::Error::new(IpcSelectionObservationError {
-            kind: IpcSelectionObservationErrorKind::UnsupportedObjectType,
-            editor,
-            requested: protocol_type.to_string(),
-            candidates: Vec::new(),
-            reason: "the bundled stable KiCad protocol cannot decode this selected object type"
-                .to_string(),
-        })),
-    }
-}
-
-fn selected_object_from_id(
-    editor: IpcEditorKind,
-    protocol_type: &str,
-    object_type: &str,
-    id: Option<kiapi::common::types::Kiid>,
-) -> Result<IpcSelectedObject> {
-    let Some(id) = id.filter(|id| !id.value.is_empty()) else {
-        return Err(malformed_selected_object(
-            editor,
-            protocol_type,
-            "selected object has no stable KIID".to_string(),
-        ));
-    };
-    Ok(IpcSelectedObject {
-        kiid: id.value,
-        object_type: object_type.to_string(),
-        protocol_type: protocol_type.to_string(),
-    })
-}
-
-fn malformed_selected_object(
-    editor: IpcEditorKind,
-    protocol_type: &str,
-    reason: String,
-) -> anyhow::Error {
-    anyhow::Error::new(IpcSelectionObservationError {
-        kind: IpcSelectionObservationErrorKind::MalformedSelectedObject,
-        editor,
-        requested: protocol_type.to_string(),
-        candidates: Vec::new(),
-        reason,
-    })
-}
-
 fn selection_kiids(observation: &IpcSelectionObservation) -> Vec<String> {
     let mut kiids = observation
         .selected_objects
         .iter()
-        .map(|object| object.kiid.clone())
+        .filter_map(|object| object.kiid.clone())
         .collect::<Vec<_>>();
     kiids.sort();
     kiids
+}
+
+/// How many selected objects were listed without a KIID.
+fn selection_without_kiid(observation: &IpcSelectionObservation) -> usize {
+    observation
+        .selected_objects
+        .iter()
+        .filter(|object| object.kiid.is_none())
+        .count()
 }
 
 fn selection_mutation_error(

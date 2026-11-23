@@ -4,6 +4,7 @@ pub mod gen;
 pub mod builders;
 pub mod client;
 mod endpoint;
+pub mod selected;
 pub mod socket;
 pub mod transform;
 pub mod types;

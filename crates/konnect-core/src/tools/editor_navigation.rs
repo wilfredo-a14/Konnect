@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_editor_selection",
-            "Read the current selection from one exact KiCad editor, project, document, and schematic sheet instance. Returns stable KIID/UUID identities and refuses stale, ambiguous, cross-project, cross-document, or unsupported selected state instead of retargeting.",
+            "Read the current selection from one exact KiCad editor, project, document, and schematic sheet instance. Returns stable KIID/UUID identities and refuses stale, ambiguous, cross-project, or cross-document state instead of retargeting. Every selected object is listed: one of a type Konnect does not know has object_type 'unrecognized' and its protocol_type, and kiid is null when the object carries none that can be read (kiid_evidence says how each KIID was read).",
             json!({
                 "type": "object",
                 "properties": {
@@ -928,19 +928,10 @@ fn selection_error_result(error: anyhow::Error) -> CallToolResult {
                 target: selection.requested.clone(),
                 candidates: selection.candidates.clone(),
             },
-            IpcSelectionObservationErrorKind::UnsupportedObjectType => {
-                ToolErrorKind::UnsupportedCapability {
-                    capability: format!("decode selected object type {}", selection.requested),
-                    kicad_version: None,
-                }
-            }
-            IpcSelectionObservationErrorKind::StaleEditorState
-            | IpcSelectionObservationErrorKind::MalformedSelectedObject => {
-                ToolErrorKind::StaleTarget {
-                    target: selection.requested.clone(),
-                    reason: selection.reason.clone(),
-                }
-            }
+            IpcSelectionObservationErrorKind::StaleEditorState => ToolErrorKind::StaleTarget {
+                target: selection.requested.clone(),
+                reason: selection.reason.clone(),
+            },
         };
         return CallToolResult::error_kind(kind, selection.to_string());
     }
