@@ -1851,7 +1851,7 @@ mod tests {
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
-        assert_eq!(definitions.len(), 13);
+        assert_eq!(definitions.len(), 14);
         let open = definitions
             .iter()
             .find(|tool| tool.name == "open_editor")
